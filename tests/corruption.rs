@@ -41,3 +41,40 @@ fn test_file_corruption() {
         );
     }
 }
+
+#[test]
+fn test_samples_beyond_streaminfo_total() {
+    use flac_codec::Error;
+    use flac_codec::decode::FlacSampleReader;
+    use flac_codec::encode::{FlacSampleWriter, Options};
+    use std::io::Cursor;
+
+    // two 4096-sample blocks of stereo audio
+    let samples: Vec<i32> = (0..8192 * 2).map(|i| (i % 1000) - 500).collect();
+    let mut flac = Cursor::new(Vec::new());
+    let mut writer = FlacSampleWriter::new(
+        &mut flac,
+        Options::default(),
+        44100,
+        16,
+        2,
+        Some(samples.len() as u64),
+    )
+    .unwrap();
+    writer.write(&samples).unwrap();
+    writer.finalize().unwrap();
+    let mut flac = flac.into_inner();
+
+    // claim 5000 samples in STREAMINFO, so the second block runs past the total
+    // (the total is the low 36 bits of the 64 bits at STREAMINFO offset 10)
+    let at = 4 + 4 + 10;
+    let packed = u64::from_be_bytes(flac[at..at + 8].try_into().unwrap());
+    let packed = (packed & !0xF_FFFF_FFFF) | 5000;
+    flac[at..at + 8].copy_from_slice(&packed.to_be_bytes());
+
+    let mut reader = FlacSampleReader::new(Cursor::new(flac)).unwrap();
+    assert!(matches!(
+        reader.read_to_end(&mut Vec::new()),
+        Err(Error::TooManySamples)
+    ));
+}
