@@ -1813,6 +1813,11 @@ fn read_residuals<R: BitRead, I: SignedInteger>(
         let partition_order = reader.read::<4, u32>()?;
         let partition_count = 1 << partition_order;
 
+        // more partitions than samples would make the partition size zero
+        if partition_count > block_size {
+            return Err(Error::InvalidPartitionOrder);
+        }
+
         let partitions = residuals.rchunks_mut(block_size / partition_count).rev();
 
         if partitions.len() != partition_count {
@@ -1853,4 +1858,21 @@ fn read_residuals<R: BitRead, I: SignedInteger>(
         1 => read_block::<0b11111, R, I>(reader, predictor_order, residuals),
         _ => Err(Error::InvalidCodingMethod),
     }
+}
+
+#[test]
+fn partition_order_larger_than_block() {
+    use bitstream_io::{BigEndian, BitReader};
+
+    // Rice coding method 0, partition order 15 (32768 partitions) for a block of 16 samples
+    let data = [0b0011_1100, 0, 0, 0];
+    let mut residuals = [0i32; 16];
+    assert!(matches!(
+        read_residuals(
+            &mut BitReader::endian(data.as_slice(), BigEndian),
+            0,
+            &mut residuals
+        ),
+        Err(Error::InvalidPartitionOrder)
+    ));
 }
