@@ -1521,9 +1521,7 @@ fn read_subframes<R: BitRead>(
                 Some(side_bps) => {
                     read_subframe(&mut reader, side_bps, side)?;
 
-                    left.iter().zip(side.iter_mut()).for_each(|(left, side)| {
-                        *side = *left - *side;
-                    });
+                    left_side(left, side);
                 }
                 None => {
                     // the very rare case of 32-bps streams
@@ -1538,11 +1536,7 @@ fn read_subframes<R: BitRead>(
                         &mut side_i64,
                     )?;
 
-                    left.iter().zip(side_i64).zip(side.iter_mut()).for_each(
-                        |((left, side_i64), side)| {
-                            *side = (*left as i64 - side_i64) as i32;
-                        },
-                    );
+                    left_side_wide(left, &side_i64, side);
                 }
             }
         }
@@ -1557,9 +1551,7 @@ fn read_subframes<R: BitRead>(
                     read_subframe(&mut reader, side_bps, side)?;
                     read_subframe(&mut reader, header.bits_per_sample.into(), right)?;
 
-                    side.iter_mut().zip(right.iter()).for_each(|(side, right)| {
-                        *side += *right;
-                    });
+                    side_right(side, right);
                 }
                 None => {
                     // the very rare case of 32-bps streams
@@ -1575,11 +1567,7 @@ fn read_subframes<R: BitRead>(
                     )?;
                     read_subframe(&mut reader, header.bits_per_sample.into(), right)?;
 
-                    side.iter_mut().zip(side_i64).zip(right.iter()).for_each(
-                        |((side, side_64), right)| {
-                            *side = (side_64 + *right as i64) as i32;
-                        },
-                    );
+                    side_right_wide(&side_i64, right, side);
                 }
             }
         }
@@ -1595,11 +1583,7 @@ fn read_subframes<R: BitRead>(
                 Some(side_bps) => {
                     read_subframe(&mut reader, side_bps, side)?;
 
-                    mid.iter_mut().zip(side.iter_mut()).for_each(|(mid, side)| {
-                        let sum = *mid * 2 + side.abs() % 2;
-                        *mid = (sum + *side) >> 1;
-                        *side = (sum - *side) >> 1;
-                    });
+                    mid_side(mid, side);
                 }
                 None => {
                     // the very rare case of 32-bps streams
@@ -1614,13 +1598,7 @@ fn read_subframes<R: BitRead>(
                         &mut side_i64,
                     )?;
 
-                    mid.iter_mut().zip(side.iter_mut()).zip(side_i64).for_each(
-                        |((mid, side), side_i64)| {
-                            let sum = *mid as i64 * 2 + (side_i64.abs() % 2);
-                            *mid = ((sum + side_i64) >> 1) as i32;
-                            *side = ((sum - side_i64) >> 1) as i32;
-                        },
-                    );
+                    mid_side_wide(mid, &side_i64, side);
                 }
             }
         }
@@ -1630,6 +1608,126 @@ fn read_subframes<R: BitRead>(
     reader.skip(16)?; // CRC-16 checksum
 
     Ok(())
+}
+
+// Stereo decorrelation. A damaged stream can push the sums past the range
+// of the sample type; wrapping arithmetic makes debug builds wrap around as
+// release builds always have, instead of panicking (the frame CRC rejects
+// such a frame afterwards).
+
+/// Left and side to left and right: `side` becomes the right channel.
+#[inline]
+fn left_side(left: &[i32], side: &mut [i32]) {
+    left.iter().zip(side.iter_mut()).for_each(|(left, side)| {
+        *side = left.wrapping_sub(*side);
+    });
+}
+
+/// Like [`left_side`], with the 33-bit side channel of a 32-bit stream.
+#[inline]
+fn left_side_wide(left: &[i32], side_i64: &[i64], side: &mut [i32]) {
+    left.iter()
+        .zip(side_i64)
+        .zip(side.iter_mut())
+        .for_each(|((left, side_i64), side)| {
+            *side = i64::from(*left).wrapping_sub(*side_i64) as i32;
+        });
+}
+
+/// Side and right to left and right: `side` becomes the left channel.
+#[inline]
+fn side_right(side: &mut [i32], right: &[i32]) {
+    side.iter_mut().zip(right.iter()).for_each(|(side, right)| {
+        *side = side.wrapping_add(*right);
+    });
+}
+
+/// Like [`side_right`], with the 33-bit side channel of a 32-bit stream.
+#[inline]
+fn side_right_wide(side_i64: &[i64], right: &[i32], side: &mut [i32]) {
+    side.iter_mut()
+        .zip(side_i64)
+        .zip(right.iter())
+        .for_each(|((side, side_i64), right)| {
+            *side = side_i64.wrapping_add(i64::from(*right)) as i32;
+        });
+}
+
+/// Mid and side to left and right.
+#[inline]
+fn mid_side(mid: &mut [i32], side: &mut [i32]) {
+    mid.iter_mut().zip(side.iter_mut()).for_each(|(mid, side)| {
+        // the low bit of side is the bit mid lost (|side| % 2, also for i32::MIN)
+        let sum = mid.wrapping_mul(2) | (*side & 1);
+        *mid = sum.wrapping_add(*side) >> 1;
+        *side = sum.wrapping_sub(*side) >> 1;
+    });
+}
+
+/// Like [`mid_side`], with the 33-bit side channel of a 32-bit stream.
+#[inline]
+fn mid_side_wide(mid: &mut [i32], side_i64: &[i64], side: &mut [i32]) {
+    mid.iter_mut()
+        .zip(side.iter_mut())
+        .zip(side_i64)
+        .for_each(|((mid, side), side_i64)| {
+            let sum = i64::from(*mid).wrapping_mul(2) | (side_i64 & 1);
+            *mid = (sum.wrapping_add(*side_i64) >> 1) as i32;
+            *side = (sum.wrapping_sub(*side_i64) >> 1) as i32;
+        });
+}
+
+#[test]
+fn decorrelation_of_valid_samples() {
+    // left 100 and right -30 are side 130 and mid 35
+    let mut right = [130];
+    left_side(&[100], &mut right);
+    assert_eq!(right, [-30]);
+
+    let mut left = [130];
+    side_right(&mut left, &[-30]);
+    assert_eq!(left, [100]);
+
+    let (mut mid, mut side) = ([35], [130]);
+    mid_side(&mut mid, &mut side);
+    assert_eq!((mid, side), ([100], [-30]));
+
+    // the same through the 33-bit side channel
+    let mut out = [0];
+    left_side_wide(&[100], &[130], &mut out);
+    assert_eq!(out, [-30]);
+    side_right_wide(&[130], &[-30], &mut out);
+    assert_eq!(out, [100]);
+    let (mut mid, mut side) = ([35], [0]);
+    mid_side_wide(&mut mid, &[130], &mut side);
+    assert_eq!((mid, side), ([100], [-30]));
+}
+
+#[test]
+fn decorrelation_overflow_wraps() {
+    // damaged samples at the edges of the range wrap around, as in release builds
+    let mut side = [i32::MAX, i32::MIN];
+    left_side(&[i32::MIN, i32::MAX], &mut side);
+    assert_eq!(side, [1, -1]);
+
+    let mut side = [i32::MAX, i32::MIN];
+    side_right(&mut side, &[1, -1]);
+    assert_eq!(side, [i32::MIN, i32::MAX]);
+
+    let (mut mid, mut side) = ([i32::MAX, i32::MIN], [i32::MIN, i32::MAX]);
+    mid_side(&mut mid, &mut side);
+    assert_eq!(mid, [1073741823, -1073741824]);
+    assert_eq!(side, [1073741823, -1073741823]);
+
+    let mut out = [0, 0];
+    left_side_wide(&[i32::MIN, 0], &[i64::MAX, i64::MIN], &mut out);
+    assert_eq!(out, [-2147483647, 0]);
+    side_right_wide(&[i64::MAX, i64::MIN], &[1, -1], &mut out);
+    assert_eq!(out, [0, -1]);
+    let (mut mid, mut side) = ([i32::MAX, i32::MIN], [0, 0]);
+    mid_side_wide(&mut mid, &[i64::MAX, i64::MIN], &mut side);
+    assert_eq!(mid, [i32::MAX, i32::MIN]);
+    assert_eq!(side, [i32::MIN, i32::MIN]);
 }
 
 fn read_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
