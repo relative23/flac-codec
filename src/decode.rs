@@ -1320,6 +1320,8 @@ struct Decoder<R> {
     current_sample: u64,
     // raw decoded frame samples
     buf: Frame,
+    // bytes read ahead of the frames decoded so far
+    input: crate::frames::ReadAhead,
 }
 
 impl<R: std::io::Read> Decoder<R> {
@@ -1339,6 +1341,7 @@ impl<R: std::io::Read> Decoder<R> {
             blocks,
             current_sample: 0,
             buf: Frame::default(),
+            input: crate::frames::ReadAhead::default(),
         }
     }
 
@@ -1386,62 +1389,129 @@ impl<R: std::io::Read> Decoder<R> {
     ///
     /// Returns any decoding error from the stream.
     fn read_frame(&mut self) -> Result<Option<&Frame>, Error> {
+        use crate::crc::{Checksum, Crc16};
+        use crate::frames::{ReadAhead, SliceBitReader};
+
+        // refills for this frame; after that, the rest of it is read from the
+        // stream, so a source that hands out tiny pieces costs no repeated work
+        let mut refills = 0;
+        loop {
+            let pending = self.input.pending();
+            let mut reader = SliceBitReader::new(pending);
+            let decoded =
+                frame_header(&self.blocks, self.current_sample, &mut reader).and_then(|header| {
+                    match header {
+                        Some(header) => read_subframes(&mut reader, &header, &mut self.buf)
+                            .map(|()| Some(u16::from(header.block_size))),
+                        None => Ok(None),
+                    }
+                });
+
+            if reader.ran_out() && !self.input.at_eof() {
+                // the frame goes on past what has been read ahead
+                if refills == ReadAhead::REFILLS || pending.len() >= ReadAhead::LIMIT {
+                    return self.read_frame_from_stream();
+                }
+                self.input.fill(&mut self.reader)?;
+                refills += 1;
+                continue;
+            }
+
+            let consumed = reader.consumed();
+            let crc16 = pending[..consumed]
+                .iter()
+                .fold(Crc16::default(), |crc, byte| crc.update(*byte));
+            // the bytes a failed frame read are consumed too, as from a stream
+            self.input.consume(consumed);
+
+            return match decoded? {
+                Some(block_size) if crc16.valid() => {
+                    self.current_sample += u64::from(block_size);
+                    Ok(Some(&self.buf))
+                }
+                Some(_) => Err(Error::Crc16Mismatch),
+                None => Ok(None),
+            };
+        }
+    }
+
+    /// Decodes a frame straight from the stream, behind the bytes already
+    /// read ahead: one too large for memory, or one from a source that
+    /// hands out small pieces
+    #[cold]
+    fn read_frame_from_stream(&mut self) -> Result<Option<&Frame>, Error> {
         use crate::crc::{Checksum, Crc16, CrcReader};
-        use crate::stream::FrameHeader;
         use bitstream_io::{BigEndian, BitReader};
         use std::io::Read;
 
-        let mut crc16_reader: CrcReader<_, Crc16> = CrcReader::new(self.reader.by_ref());
-
-        let header = match self
-            .blocks
-            .streaminfo()
-            .total_samples
-            .map(|total| total.get().checked_sub(self.current_sample))
-        {
-            Some(Some(0)) => return Ok(None),
-            Some(Some(remaining)) => {
-                FrameHeader::read(crc16_reader.by_ref(), self.blocks.streaminfo()).and_then(
-                    |header| {
-                        let block_size = u16::from(header.block_size);
-                        if u64::from(block_size) > remaining {
-                            // a block may not run past the total in STREAMINFO
-                            Err(Error::TooManySamples)
-                        } else if u64::from(block_size) == remaining || block_size > 14 {
-                            // only the last block in a stream may contain <= 14 samples
-                            Ok(header)
-                        } else {
-                            Err(Error::ShortBlock)
-                        }
-                    },
-                )?
-            }
-            Some(None) => return Err(Error::TooManySamples),
-            // if total number of remaining samples isn't known,
-            // treat an EOF error as the end of stream
-            // (this is an uncommon case)
-            None => match FrameHeader::read(crc16_reader.by_ref(), self.blocks.streaminfo()) {
-                Ok(header) => header,
-                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(None);
+        let pending = self.input.take_pending();
+        let mut rest = pending.as_slice();
+        let decoded = {
+            let mut crc16_reader: CrcReader<_, Crc16> =
+                CrcReader::new((&mut rest).chain(self.reader.by_ref()));
+            frame_header(&self.blocks, self.current_sample, &mut crc16_reader).and_then(|header| {
+                match header {
+                    Some(header) => read_subframes(
+                        BitReader::endian(crc16_reader.by_ref(), BigEndian),
+                        &header,
+                        &mut self.buf,
+                    )
+                    .map(|()| Some((u16::from(header.block_size), crc16_reader.into_checksum()))),
+                    None => Ok(None),
                 }
-                Err(err) => return Err(err),
-            },
+            })
         };
+        // whatever the frame did not read stays ahead of the stream
+        self.input.restore(rest);
 
-        read_subframes(
-            BitReader::endian(crc16_reader.by_ref(), BigEndian),
-            &header,
-            &mut self.buf,
-        )?;
-
-        if !crc16_reader.into_checksum().valid() {
-            return Err(Error::Crc16Mismatch);
+        match decoded? {
+            Some((block_size, crc16)) if crc16.valid() => {
+                self.current_sample += u64::from(block_size);
+                Ok(Some(&self.buf))
+            }
+            Some(_) => Err(Error::Crc16Mismatch),
+            None => Ok(None),
         }
+    }
+}
 
-        self.current_sample += u64::from(u16::from(header.block_size));
+/// Reads the next frame's header, or `None` at the end of the stream
+fn frame_header<R: std::io::Read>(
+    blocks: &BlockList,
+    current_sample: u64,
+    reader: &mut R,
+) -> Result<Option<crate::stream::FrameHeader>, Error> {
+    use crate::stream::FrameHeader;
 
-        Ok(Some(&self.buf))
+    match blocks
+        .streaminfo()
+        .total_samples
+        .map(|total| total.get().checked_sub(current_sample))
+    {
+        Some(Some(0)) => Ok(None),
+        Some(Some(remaining)) => {
+            FrameHeader::read(reader, blocks.streaminfo()).and_then(|header| {
+                let block_size = u16::from(header.block_size);
+                if u64::from(block_size) > remaining {
+                    // a block may not run past the total in STREAMINFO
+                    Err(Error::TooManySamples)
+                } else if u64::from(block_size) == remaining || block_size > 14 {
+                    // only the last block in a stream may contain <= 14 samples
+                    Ok(Some(header))
+                } else {
+                    Err(Error::ShortBlock)
+                }
+            })
+        }
+        Some(None) => Err(Error::TooManySamples),
+        // if total number of remaining samples isn't known,
+        // treat an EOF error as the end of stream
+        // (this is an uncommon case)
+        None => match FrameHeader::read(reader, blocks.streaminfo()) {
+            Ok(header) => Ok(Some(header)),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(err) => Err(err),
+        },
     }
 }
 
@@ -1478,12 +1548,14 @@ impl<R: std::io::Seek> Decoder<R> {
                         assert!(*sample_offset <= sample);
                         self.reader
                             .seek(SeekFrom::Start(frames_start + byte_offset))?;
+                        self.input.clear();
                         self.current_sample = *sample_offset;
                         Ok(*sample_offset)
                     }
                     _ => {
                         // empty seektable so rewind to start of stream
                         self.reader.seek(SeekFrom::Start(frames_start))?;
+                        self.input.clear();
                         self.current_sample = 0;
                         Ok(0)
                     }
@@ -1493,6 +1565,7 @@ impl<R: std::io::Seek> Decoder<R> {
                 // no seektable
                 // all we can do is rewind data to start of stream
                 self.reader.seek(SeekFrom::Start(frames_start))?;
+                self.input.clear();
                 self.current_sample = 0;
                 Ok(0)
             }
