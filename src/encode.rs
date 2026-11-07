@@ -3205,6 +3205,27 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
     ) -> Result<(&'w [i32], &'r [i32]), ResidualOverflow> {
         residuals.clear();
 
+        // fixed-size loops for the usual orders, which the compiler unrolls
+        // and vectorizes; the same arithmetic as the general loop below
+        macro_rules! orders {
+            ($($n:literal)*) => {
+                match parameters.coefficients.len() {
+                    $($n => {
+                        if let Ok(coefficients) =
+                            <&[i32; $n]>::try_from(parameters.coefficients.as_slice())
+                        {
+                            lpc_residuals(coefficients, parameters.shift, channel, residuals)?;
+                            return Ok((&channel[0..$n], residuals.as_slice()));
+                        }
+                    })*
+                    _ => {}
+                }
+            };
+        }
+        if usize::from(parameters.order.get()) == parameters.coefficients.len() {
+            orders!(1 2 3 4 5 6 7 8 9 10 11 12);
+        }
+
         for split in usize::from(parameters.order.get())..channel.len() {
             let (previous, current) = channel.split_at(split);
 
@@ -3227,6 +3248,89 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
             &channel[0..parameters.order.get().into()],
             residuals.as_slice(),
         ))
+    }
+}
+
+/// LPC residuals for exactly `N` coefficients: each sample less its
+/// prediction, an error if one does not fit in 32 bits
+#[inline]
+fn lpc_residuals<const N: usize>(
+    coefficients: &[i32; N],
+    shift: u32,
+    channel: &[i32],
+    residuals: &mut Vec<i32>,
+) -> Result<(), ResidualOverflow> {
+    let mut overflow = false;
+    residuals.extend(channel.windows(N + 1).map(|window| {
+        let (history, current) = window.split_at(N);
+        let prediction = history
+            .iter()
+            .rev()
+            .zip(coefficients)
+            .map(|(x, y)| i64::from(*x) * i64::from(*y))
+            .sum::<i64>()
+            >> shift;
+        // as `i32::checked_sub` in the general loop, but without stopping
+        let residual = i64::from(current[0]) - i64::from(prediction as i32);
+        overflow |= residual != i64::from(residual as i32);
+        residual as i32
+    }));
+    match overflow {
+        false => Ok(()),
+        true => Err(ResidualOverflow),
+    }
+}
+
+#[test]
+fn lpc_residuals_by_order_match_the_general_loop() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for order in 1..=12usize {
+        for round in 0..60 {
+            // large samples and coefficients, so that some residuals overflow
+            let bits = [8, 16, 24, 31][round % 4];
+            let coefficients: Vec<i32> = (0..order).map(|_| (next() as i16 >> 1).into()).collect();
+            let shift = (next() % 16) as u32;
+            let channel: Vec<i32> = (0..200).map(|_| (next() as i32) >> (32 - bits)).collect();
+
+            let general: Result<Vec<i32>, ()> = (order..channel.len())
+                .map(|split| {
+                    let (previous, current) = channel.split_at(split);
+                    current[0]
+                        .checked_sub(
+                            (previous
+                                .iter()
+                                .rev()
+                                .zip(&coefficients)
+                                .map(|(x, y)| *x as i64 * *y as i64)
+                                .sum::<i64>()
+                                >> shift) as i32,
+                        )
+                        .ok_or(())
+                })
+                .collect();
+
+            let parameters = LpcParameters {
+                order: NonZero::new(order as u8).unwrap(),
+                precision: SignedBitCount::new::<15>(),
+                shift,
+                coefficients: coefficients.iter().copied().collect(),
+            };
+            let mut residuals = vec![];
+            let fast =
+                LpcSubframeParameters::encode_residuals(&parameters, &channel, &mut residuals)
+                    .map(|(warm_up, residuals)| {
+                        assert_eq!(warm_up, &channel[..order]);
+                        residuals.to_vec()
+                    })
+                    .map_err(|ResidualOverflow| ());
+            assert_eq!(fast, general, "order {order}, {bits} bits");
+        }
     }
 }
 
