@@ -261,6 +261,35 @@ impl<'s> SliceBitReader<'s> {
     }
 }
 
+impl SliceBitReader<'_> {
+    /// The next Rice-coded value with parameter `k` (at most 30), before
+    /// zigzag decoding: the same as a unary count and `k` more bits
+    #[inline]
+    pub(crate) fn rice(&mut self, k: u32) -> io::Result<u32> {
+        if self.bits < 32 {
+            self.refill();
+        }
+        // the usual case: the whole code is cached
+        let zeros = self.cache.leading_zeros();
+        if zeros < self.bits && zeros + 1 + k <= self.bits {
+            let rest = (self.cache << zeros) << 1;
+            let lsb = match k {
+                0 => 0,
+                k => (rest >> (64 - k)) as u32,
+            };
+            self.cache = rest.checked_shl(k).unwrap_or(0);
+            self.bits -= zeros + 1 + k;
+            return Ok((zeros << k) | lsb);
+        }
+        let msb = self.unary(true)?;
+        let lsb = match k {
+            0 => 0,
+            k => self.take(k)? as u32,
+        };
+        Ok((msb << k) | lsb)
+    }
+}
+
 /// An unsigned value of up to 64 bits in a type at least that wide
 #[inline]
 fn unsigned_from_u64<U: UnsignedInteger>(value: u64) -> U {
@@ -467,7 +496,7 @@ mod test {
             let mut ours = SliceBitReader::new(&data);
 
             for step in 0..40 {
-                let op = rng.below(15);
+                let op = rng.below(16);
                 let n = rng.below(70) as u32;
                 let context =
                     format!("round {round}, step {step}, op {op}, n {n}, data {data:02x?}");
@@ -518,6 +547,22 @@ mod test {
                         true
                     }
                     12 => same!(r => r.read_to::<u32>()),
+                    // a Rice code: a unary count and then `k` bits
+                    15 => {
+                        let k = n % 31;
+                        let a = theirs.read_unary::<1>().and_then(|msb| {
+                            theirs
+                                .read_unsigned_counted::<32, u32>(BitCount::try_from(k).unwrap())
+                                .map(|lsb| (msb << k) | lsb)
+                        });
+                        let b = ours.rice(k);
+                        match (&a, &b) {
+                            (Ok(x), Ok(y)) => assert_eq!(x, y, "{context}"),
+                            (Err(x), Err(y)) => assert_eq!(x.kind(), y.kind(), "{context}"),
+                            _ => panic!("{context}: {a:?} against {b:?}"),
+                        }
+                        a.is_ok()
+                    }
                     // bitstream-io mixes bit orders for this read when it is not
                     // byte-aligned; frames never use it, so compare it aligned
                     13 => {

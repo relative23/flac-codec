@@ -1573,7 +1573,7 @@ impl<R: std::io::Seek> Decoder<R> {
     }
 }
 
-fn read_subframes<R: BitRead>(
+fn read_subframes<R: ReadRice>(
     mut reader: R,
     header: &crate::stream::FrameHeader,
     buf: &mut Frame,
@@ -1812,7 +1812,7 @@ fn decorrelation_overflow_wraps() {
     assert_eq!(side, [i32::MIN, i32::MIN]);
 }
 
-fn read_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
+fn read_subframe<const MAX: u32, R: ReadRice, I: SignedInteger>(
     reader: &mut R,
     bits_per_sample: SignedBitCount<MAX>,
     channel: &mut [I],
@@ -1855,7 +1855,7 @@ fn read_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
     Ok(())
 }
 
-fn read_fixed_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
+fn read_fixed_subframe<const MAX: u32, R: ReadRice, I: SignedInteger>(
     reader: &mut R,
     bits_per_sample: SignedBitCount<MAX>,
     coefficients: &[i64],
@@ -1875,7 +1875,7 @@ fn read_fixed_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
     Ok(())
 }
 
-fn read_lpc_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
+fn read_lpc_subframe<const MAX: u32, R: ReadRice, I: SignedInteger>(
     reader: &mut R,
     bits_per_sample: SignedBitCount<MAX>,
     predictor_order: NonZero<u8>,
@@ -2087,12 +2087,51 @@ fn verify_prediction() {
     );
 }
 
-fn read_residuals<R: BitRead, I: SignedInteger>(
+/// Bit readers that decode Rice codes
+///
+/// The provided method reads the code as two values; the decoder's own
+/// slice reader takes it in one go.
+trait ReadRice: BitRead {
+    /// The next Rice-coded value with parameter `rice`, before zigzag decoding
+    #[inline]
+    fn read_rice<const RICE_MAX: u32>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+    ) -> std::io::Result<u32> {
+        let msb = self.read_unary::<1>()?;
+        let lsb = self.read_counted::<RICE_MAX, u32>(rice)?;
+        Ok((msb << u32::from(rice)) | lsb)
+    }
+}
+
+impl<R: std::io::Read, E: bitstream_io::Endianness> ReadRice for bitstream_io::BitReader<R, E> {}
+
+impl ReadRice for crate::frames::SliceBitReader<'_> {
+    #[inline]
+    fn read_rice<const RICE_MAX: u32>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+    ) -> std::io::Result<u32> {
+        self.rice(u32::from(rice))
+    }
+}
+
+impl<T: ReadRice + ?Sized> ReadRice for &mut T {
+    #[inline]
+    fn read_rice<const RICE_MAX: u32>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+    ) -> std::io::Result<u32> {
+        (**self).read_rice(rice)
+    }
+}
+
+fn read_residuals<R: ReadRice, I: SignedInteger>(
     reader: &mut R,
     predictor_order: usize,
     residuals: &mut [I],
 ) -> Result<(), Error> {
-    fn read_block<const RICE_MAX: u32, R: BitRead, I: SignedInteger>(
+    fn read_block<const RICE_MAX: u32, R: ReadRice, I: SignedInteger>(
         reader: &mut R,
         predictor_order: usize,
         residuals: &mut [I],
@@ -2117,9 +2156,7 @@ fn read_residuals<R: BitRead, I: SignedInteger>(
             match reader.parse()? {
                 ResidualPartitionHeader::Standard { rice } => {
                     partition.iter_mut().try_for_each(|s| {
-                        let msb = reader.read_unary::<1>()?;
-                        let lsb = reader.read_counted::<RICE_MAX, u32>(rice)?;
-                        let unsigned = (msb << u32::from(rice)) | lsb;
+                        let unsigned = reader.read_rice::<RICE_MAX>(rice)?;
                         *s = if (unsigned & 1) == 1 {
                             -(I::from_u32(unsigned >> 1)) - I::ONE
                         } else {
