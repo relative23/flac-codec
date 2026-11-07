@@ -1748,16 +1748,52 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
     for split in coefficients.len()..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
 
-        residuals[0] += I::from_i64(
-            predicted
-                .iter()
-                .rev()
-                .zip(coefficients)
-                .map(|(x, y)| (*x).into() * y)
-                .sum::<i64>()
-                >> qlp_shift,
+        // wrapping arithmetic in 64 bits, truncated to the sample type:
+        // a damaged stream wraps around in debug builds as it does in
+        // release builds instead of panicking (its frame CRC rejects
+        // the result afterwards)
+        residuals[0] = I::from_i64(
+            residuals[0].into().wrapping_add(
+                predicted
+                    .iter()
+                    .rev()
+                    .zip(coefficients)
+                    .fold(0i64, |sum, (x, y)| {
+                        sum.wrapping_add((*x).into().wrapping_mul(*y))
+                    })
+                    >> qlp_shift,
+            ),
         );
     }
+}
+
+#[test]
+fn prediction_overflow_wraps() {
+    // a damaged residual can push a sample past i32's range
+    let mut buffer = [i32::MAX, 1, i32::MIN, -1];
+    predict(&[1], 0, &mut buffer);
+    assert_eq!(
+        buffer,
+        [
+            i32::MAX,
+            i32::MAX.wrapping_add(1),
+            i32::MAX.wrapping_add(1).wrapping_add(i32::MIN),
+            i32::MAX
+                .wrapping_add(1)
+                .wrapping_add(i32::MIN)
+                .wrapping_sub(1),
+        ]
+    );
+
+    // in the 64-bit side channel of 32-bit streams, damaged samples
+    // can grow until the products overflow too
+    let mut wide = [i64::MAX, 1, 1];
+    predict(&[2], 0, &mut wide);
+    let second = 1i64.wrapping_add(i64::MAX.wrapping_mul(2));
+    assert_eq!(
+        wide,
+        [i64::MAX, second, 1i64.wrapping_add(second.wrapping_mul(2))]
+    );
 }
 
 #[test]
