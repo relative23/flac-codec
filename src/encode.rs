@@ -3873,6 +3873,12 @@ fn write_residuals<W: BitWrite>(
             .filter_map(|partition_count| {
                 let mut estimated_bits = 0;
 
+                // a predictor order of at least the partition size leaves fewer
+                // chunks than partitions, which this partition order cannot describe
+                if block_size / partition_count <= block_size - residuals.len() {
+                    return None;
+                }
+
                 let partitions = residuals
                     .rchunks(block_size / partition_count)
                     .rev()
