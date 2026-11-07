@@ -91,11 +91,14 @@ impl Frame {
 
     /// Iterates over any samples in interleaved order
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = i32> {
-        MultiZip {
-            iters: self.channels().map(|c| c.iter().copied()).collect(),
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = i32> + '_ {
+        Interleaved {
+            samples: &self.samples[..self.channels * self.channel_len],
+            channels: self.channels,
+            channel_len: self.channel_len,
+            frame: 0,
+            channel: 0,
         }
-        .flatten()
     }
 
     #[inline]
@@ -225,6 +228,46 @@ impl Frame {
     }
 }
 
+/// A frame's samples in interleaved order, read straight from the
+/// channel-stacked buffer
+struct Interleaved<'f> {
+    samples: &'f [i32],
+    channels: usize,
+    channel_len: usize,
+    // the next PCM frame and channel
+    frame: usize,
+    channel: usize,
+}
+
+impl Iterator for Interleaved<'_> {
+    type Item = i32;
+
+    #[inline]
+    fn next(&mut self) -> Option<i32> {
+        if self.frame == self.channel_len {
+            return None;
+        }
+        let sample = self
+            .samples
+            .get(self.channel * self.channel_len + self.frame)
+            .copied();
+        self.channel += 1;
+        if self.channel == self.channels {
+            self.channel = 0;
+            self.frame += 1;
+        }
+        sample
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = (self.channel_len - self.frame) * self.channels - self.channel;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for Interleaved<'_> {}
+
 const MAX_CHANNELS: usize = 8;
 
 pub struct MultiZip<I> {
@@ -245,6 +288,36 @@ impl<I> FromIterator<I> for MultiZip<I> {
     fn from_iter<T: IntoIterator<Item = I>>(iter: T) -> Self {
         Self {
             iters: iter.into_iter().collect(),
+        }
+    }
+}
+
+#[test]
+fn interleaves_like_multizip() {
+    for channels in 1..=8 {
+        for len in [0, 1, 7, 4096] {
+            let mut frame = Frame::empty(channels, 16);
+            frame
+                .resize(16, channels, len)
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, s)| *s = i as i32);
+            // (`channels` needs at least one sample per channel)
+            let expected: Vec<i32> = match len {
+                0 => vec![],
+                _ => MultiZip {
+                    iters: frame.channels().map(|c| c.iter().copied()).collect(),
+                }
+                .flatten()
+                .collect(),
+            };
+            let iter = frame.iter();
+            assert_eq!(iter.len(), channels * len);
+            assert_eq!(
+                iter.collect::<Vec<_>>(),
+                expected,
+                "{channels} channels, {len}"
+            );
         }
     }
 }
