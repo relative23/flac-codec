@@ -3855,7 +3855,7 @@ fn write_residuals<W: BitWrite>(
 
                     self.residuals.iter().try_for_each(|s| {
                         let (msb, lsb) = mask(if s.is_negative() {
-                            ((-*s as u32 - 1) << 1) + 1
+                            ((s.unsigned_abs() - 1) << 1) + 1
                         } else {
                             (*s as u32) << 1
                         });
