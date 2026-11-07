@@ -19,6 +19,17 @@ pull request.
 | `96ce42e` | Use wrapping arithmetic in stereo decorrelation (debug builds; decoding to samples about 4 % faster, no change with MD5 verification) | `fix-stereo-decorrelation-overflow` | also fixed in #4 |
 | `65abdc8` | Never write fewer residual partitions than the partition order says (the encoder wrote streams no decoder can read, e.g. with the default options for a last block of 4 samples) | `fix-encoder-short-block-partitions` | also fixed in #4 (its commit `2503845`); not reported separately |
 | `ebfd19b` | Allow LPC order 32 in debug builds (a debug assertion rejected the highest order the options accept) | `fix-lpc-order-32-debug-assertion` | not in #4; not reported yet |
+| `4474e6b` | Write a residual of i32::MIN without overflowing (debug builds; found by the `roundtrip` fuzz target) | `fix-residual-min-negation` | also fixed in #4 |
+| `f57ffea` | Write STREAMINFO's bit depth without unwrapping (a damaged STREAMINFO with 1 bit per sample panicked when written back, release builds too; found by the `metadata` fuzz target) | `fix-streaminfo-low-bit-depth-write` | also fixed in #4, with the same line |
+
+## Speed
+
+Each change keeps the encoder's output byte-identical and sits alone on a `perf-*`
+branch based on upstream `master`.
+
+| Commit | Change | `perf-*` branch | Upstream status |
+|---|---|---|---|
+| `772b45a` | Count both subframe candidates (FIXED and LPC) and write only the smaller | `perf-encoder-count-candidates` | not offered yet |
 
 ## Fork only
 
@@ -90,22 +101,34 @@ crates included), MIT or Apache-2.0 only, one version per crate, crates.io only.
   16 MiB comment block of 4.2 million empty comments, the largest factor (a stream may
   hold one comment block, so about 100 MB is the most it can cost).
 - `cargo deny check`: advisories, bans, licenses and sources ok.
+- cargo-fuzz, 30 minutes per target with AddressSanitizer and debug assertions: the first
+  run found the last two fixes within a minute (`metadata`, `roundtrip`). After them:
+  `decode` 430,658 runs, `seek` 216,667,403, `metadata` 128,754,571, `roundtrip`
+  4,404,684, nothing found.
+- All 111 tests pass on this branch; the encoder output for the 64 IETF subset files is
+  byte-identical to upstream 1.3.3 for the default, best and fast settings.
 
-## Speed (2026-11-07, one pinned core, 64 IETF subset files with 98.6 million samples)
+## Speed measurements (2026-11-07, one pinned core, 64 IETF subset files with 98.6 million samples)
 
-Best of 5 runs, three rounds (two for `verify`) alternating between upstream 1.3.3
-and this branch:
+Best of 5 runs, three rounds alternating between upstream 1.3.3 and this branch (head
+`772b45a`, all fixes and the speed change above); libFLAC 1.5.0's `flac` on the same core
+in a container:
 
 | | upstream 1.3.3 | this branch | change | libFLAC 1.5.0 |
 |---|---|---|---|---|
-| decode to samples | 1.553 s | 1.490 s | −4.1 % | |
-| decode with MD5 check (`verify`, `flac -t`) | 1.965 s | 1.968 s | none | 0.837 s |
-| encode, fast (`flac -0`) | 2.405 s | 2.352 s | −2.2 % | 0.682 s |
-| encode, default (`flac -5`) | 5.626 s | 5.467 s | −2.8 % | 1.139 s |
-| encode, best (`flac -8`) | 6.085 s | 5.979 s | −1.7 % | 2.859 s |
+| encode, default (`flac -5`) | 5.639 s | 4.637 s | −17.8 % | 1.139 s |
+| encode, best (`flac -8`) | 6.111 s | 5.155 s | −15.6 % | 2.859 s |
+| encode, fast (`flac -0`) | 2.412 s | 2.372 s | −1.7 % | 0.682 s |
+| decode to samples | 1.566 s | 1.534 s | −2.0 % | |
+| decode with MD5 check (`verify`, `flac -t`) | 1.925 s | 1.925 s | none | 0.837 s |
 
-The encoder executes 0.8 % fewer instructions (cachegrind, three files); the decoder
-executes 0.18 % fewer, so its gain comes from inlining rather than from less work. The
-presets do not match libFLAC's levels exactly, and libFLAC's times include reading WAV
-files and writing FLAC files on tmpfs, while flac-codec works in memory. libFLAC is
-2.1 to 4.8 times faster.
+With `rayon` on all 32 threads, the default encode takes 2.84 s. The presets do not
+match libFLAC's levels exactly, and libFLAC's times include reading WAV files and writing
+FLAC files on tmpfs, while flac-codec works in memory. libFLAC is still 1.8 to 4.1 times
+faster on one core.
+
+Where the time goes (callgrind, after the speed change): in the encoder, the LPC search
+and residuals about 13 %, partition estimates 7 %, bit recording 9 %, FIXED residuals 5 %,
+copies 4 %, MD5 2 %; in the decoder, 39 % of all instructions fetch single bytes through
+`CrcReader` for bitstream-io (decoding from memory instead of a `BufReader` saves only
+9 %), residual decoding and prediction most of the rest.
