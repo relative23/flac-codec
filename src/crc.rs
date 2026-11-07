@@ -186,3 +186,84 @@ impl Checksum for Crc16 {
         self.0 == 0
     }
 }
+
+/// Tables for computing CRC-16 eight bytes at a time ("slicing by 8"):
+/// entry `k` of a byte is its checksum followed by `k` zero bytes
+const fn crc16_tables() -> [[u16; 256]; 8] {
+    let mut tables = [[0u16; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let previous = tables[k - 1][i];
+            tables[k][i] = (previous << 8) ^ tables[0][(previous >> 8) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
+}
+
+static CRC16_TABLES: [[u16; 256]; 8] = crc16_tables();
+
+impl Crc16 {
+    /// The checksum after `bytes`, the same as updating byte by byte
+    pub fn update_slice(self, bytes: &[u8]) -> Self {
+        let t = &CRC16_TABLES;
+        let mut crc = self.0;
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            let x0 = c[0] ^ (crc >> 8) as u8;
+            let x1 = c[1] ^ crc as u8;
+            crc = t[7][usize::from(x0)]
+                ^ t[6][usize::from(x1)]
+                ^ t[5][usize::from(c[2])]
+                ^ t[4][usize::from(c[3])]
+                ^ t[3][usize::from(c[4])]
+                ^ t[2][usize::from(c[5])]
+                ^ t[1][usize::from(c[6])]
+                ^ t[0][usize::from(c[7])];
+        }
+        rest.iter().fold(Self(crc), |crc, byte| crc.update(*byte))
+    }
+}
+
+#[test]
+fn crc16_by_slices_matches_bytes() {
+    let mut seed = 0x0123_4567_89AB_CDEFu64;
+    for len in 0..200 {
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        for start in [0u16, 0x1234, 0xFFFF] {
+            let by_bytes = bytes
+                .iter()
+                .fold(Crc16(start), |crc, byte| crc.update(*byte));
+            assert_eq!(
+                Crc16(start).update_slice(&bytes).0,
+                by_bytes.0,
+                "length {len}"
+            );
+        }
+    }
+}

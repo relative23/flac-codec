@@ -1418,9 +1418,7 @@ impl<R: std::io::Read> Decoder<R> {
             }
 
             let consumed = reader.consumed();
-            let crc16 = pending[..consumed]
-                .iter()
-                .fold(Crc16::default(), |crc, byte| crc.update(*byte));
+            let crc16 = Crc16::default().update_slice(&pending[..consumed]);
             // the bytes a failed frame read are consumed too, as from a stream
             self.input.consume(consumed);
 
