@@ -684,6 +684,43 @@ fn test_wasted_bits() {
     );
 }
 
+#[test]
+fn test_short_last_block() {
+    use flac_codec::decode::FlacSampleReader;
+    use flac_codec::encode::FlacSampleWriter;
+
+    // a full block followed by a last block of 4 samples, for which the encoder
+    // chose a second-order predictor and partition order 2
+    let samples: Vec<i32> = (0..4096)
+        .map(|i| (f64::from(i) * 0.001).sin() * 800_000.0)
+        .map(|s| s as i32)
+        .chain([840767, 840140, 839513, 838884])
+        .collect();
+
+    for options in [
+        Options::default(),
+        Options::default().max_lpc_order(None).unwrap(),
+    ] {
+        let mut flac = Cursor::new(vec![]);
+
+        let mut writer =
+            FlacSampleWriter::new(&mut flac, options, 44100, 21, 1, Some(samples.len() as u64))
+                .unwrap();
+        writer.write(&samples).unwrap();
+        writer.finalize().unwrap();
+
+        assert!(flac.rewind().is_ok());
+
+        let mut output = vec![];
+        FlacSampleReader::new(flac)
+            .unwrap()
+            .read_to_end(&mut output)
+            .unwrap();
+
+        assert_eq!(output, samples);
+    }
+}
+
 fn generate_sine_1(
     full_scale: f64,
     sample_rate: f64,
