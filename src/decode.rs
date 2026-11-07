@@ -1916,6 +1916,22 @@ fn read_lpc_subframe<const MAX: u32, R: BitRead, I: SignedInteger>(
 }
 
 fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut [I]) {
+    // fixed-size loops for the usual orders (FIXED 1 to 4, LPC up to 12),
+    // which the compiler unrolls; the same arithmetic as the general loop
+    macro_rules! orders {
+        ($($n:literal)*) => {
+            match coefficients.len() {
+                $($n => {
+                    if let Ok(coefficients) = <&[i64; $n]>::try_from(coefficients) {
+                        return predict_order(coefficients, qlp_shift, channel);
+                    }
+                })*
+                _ => {}
+            }
+        };
+    }
+    orders!(1 2 3 4 5 6 7 8 9 10 11 12);
+
     for split in coefficients.len()..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
 
@@ -1935,6 +1951,64 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
                     >> qlp_shift,
             ),
         );
+    }
+}
+
+/// `predict` for exactly `N` coefficients
+#[inline]
+fn predict_order<const N: usize, I: SignedInteger>(
+    coefficients: &[i64; N],
+    qlp_shift: u32,
+    channel: &mut [I],
+) {
+    for split in N..channel.len() {
+        let (predicted, residuals) = channel.split_at_mut(split);
+        let Some(history) = predicted.last_chunk::<N>() else {
+            return;
+        };
+        // wrapping in 64 bits, truncated to the sample type, as in `predict`
+        let sum = history
+            .iter()
+            .rev()
+            .zip(coefficients)
+            .fold(0i64, |sum, (x, y)| {
+                sum.wrapping_add((*x).into().wrapping_mul(*y))
+            });
+        residuals[0] = I::from_i64(residuals[0].into().wrapping_add(sum >> qlp_shift));
+    }
+}
+
+#[test]
+fn prediction_by_order_matches_the_general_loop() {
+    // every specialised order against the general loop, with values that wrap
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for order in 1..=14 {
+        for _ in 0..50 {
+            let coefficients: Vec<i64> = (0..order).map(|_| next() as i16 as i64).collect();
+            let shift = (next() % 16) as u32;
+            let samples: Vec<i32> = (0..64).map(|_| next() as i32).collect();
+            let mut general = samples.clone();
+            for split in coefficients.len()..general.len() {
+                let (predicted, residuals) = general.split_at_mut(split);
+                let sum = predicted
+                    .iter()
+                    .rev()
+                    .zip(&coefficients)
+                    .fold(0i64, |sum, (x, y)| {
+                        sum.wrapping_add(i64::from(*x).wrapping_mul(*y))
+                    });
+                residuals[0] = (i64::from(residuals[0]).wrapping_add(sum >> shift)) as i32;
+            }
+            let mut fast = samples.clone();
+            predict(&coefficients, shift, &mut fast);
+            assert_eq!(fast, general, "order {order}");
+        }
     }
 }
 
