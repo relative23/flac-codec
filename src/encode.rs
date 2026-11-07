@@ -3062,13 +3062,16 @@ fn fixed_parameters<'c>(
             match prev_order.split_at_checked(1) {
                 Some((_, r)) => {
                     buf.clear();
-                    for (n, p) in r.iter().zip(*prev_order) {
-                        match n.checked_sub(*p) {
-                            Some(v) => {
-                                buf.push(v);
-                            }
-                            None => break 'outer,
-                        }
+                    // every difference, then whether one overflowed, which stops
+                    // at the same order as checking each one
+                    let mut overflow = false;
+                    buf.extend(r.iter().zip(*prev_order).map(|(n, p)| {
+                        let difference = i64::from(*n) - i64::from(*p);
+                        overflow |= difference != i64::from(difference as i32);
+                        difference as i32
+                    }));
+                    if overflow {
+                        break 'outer;
                     }
                     if buf.is_empty() {
                         break;
@@ -3094,6 +3097,60 @@ fn fixed_parameters<'c>(
             })
             .map(|(order, residuals)| (order as u8, &channel[0..order], residuals))
             .unwrap()
+    }
+}
+
+#[test]
+fn fixed_parameters_match_checking_each_difference() {
+    // the previous algorithm: stop at the first difference that overflows
+    fn previous(channel: &[i32]) -> (u8, Vec<i32>) {
+        let mut orders: Vec<Vec<i32>> = vec![channel.to_vec()];
+        'outer: for _ in 0..4 {
+            let prev = orders.last().unwrap().clone();
+            if prev.len() < 2 {
+                break;
+            }
+            let mut next = vec![];
+            for (n, p) in prev[1..].iter().zip(&prev) {
+                match n.checked_sub(*p) {
+                    Some(v) => next.push(v),
+                    None => break 'outer,
+                }
+            }
+            orders.push(next);
+        }
+        let min = orders.last().unwrap().len();
+        let (order, residuals) = orders
+            .into_iter()
+            .enumerate()
+            .min_by_key(|(_, r)| {
+                r[r.len() - min..]
+                    .iter()
+                    .map(|v| u64::from(v.unsigned_abs()))
+                    .sum::<u64>()
+            })
+            .unwrap();
+        (order as u8, residuals)
+    }
+
+    let mut seed = 0x1357_9BDF_2468_ACE0u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..400 {
+        // full-scale 32-bit values overflow their differences, smaller ones do not
+        let bits = [8, 16, 24, 30, 32][round % 5];
+        let len = 1 + (next() % 300) as usize;
+        let channel: Vec<i32> = (0..len).map(|_| (next() as i32) >> (32 - bits)).collect();
+        let mut cache = FixedCache::default();
+        let (order, warm_up, residuals) = fixed_parameters(&mut cache, &channel);
+        let (expected_order, expected_residuals) = previous(&channel);
+        assert_eq!(order, expected_order, "round {round}");
+        assert_eq!(warm_up, &channel[..usize::from(order)]);
+        assert_eq!(residuals, expected_residuals.as_slice(), "round {round}");
     }
 }
 
