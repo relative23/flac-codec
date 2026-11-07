@@ -205,6 +205,51 @@ fn test_fractional() {
 }
 
 #[test]
+fn test_residual_of_i32_min() {
+    use flac_codec::decode::FlacSampleReader;
+    use flac_codec::encode::FlacSampleWriter;
+
+    // 32-bit samples where a first-order residual reaches i32::MIN (-1 - i32::MAX)
+    let samples = [
+        -48641,
+        -1,
+        -1,
+        -1,
+        -1,
+        1094844415,
+        1094795585,
+        i32::MAX,
+        -1,
+        -1,
+        255,
+    ];
+
+    let mut flac = Cursor::new(vec![]);
+
+    let mut writer = FlacSampleWriter::new(
+        &mut flac,
+        Options::default(),
+        44100,
+        32,
+        1,
+        Some(samples.len() as u64),
+    )
+    .unwrap();
+    writer.write(&samples).unwrap();
+    writer.finalize().unwrap();
+
+    assert!(flac.rewind().is_ok());
+
+    let mut output = vec![];
+    FlacSampleReader::new(flac)
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+
+    assert_eq!(output, samples);
+}
+
+#[test]
 fn test_roundtrip() {
     struct Samples {
         channels: usize,
