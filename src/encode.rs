@@ -24,7 +24,7 @@ use crate::metadata::{
 use crate::stream::{ChannelAssignment, FrameNumber, Independent, SampleRate};
 use crate::{Counter, Error};
 use arrayvec::ArrayVec;
-use bitstream_io::{BigEndian, BitRecorder, BitWrite, BitWriter, SignedBitCount};
+use bitstream_io::{BigEndian, BitRecorder, BitWrite, BitWriter, BitsWritten, SignedBitCount};
 use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZero;
@@ -2903,35 +2903,48 @@ fn encode_subframe<'c>(
         Some(max_lpc_order) => {
             lpc_output.clear();
 
+            // both candidates are only counted, and the smaller one is written
+            // (FIXED when they are the same size)
             match join(
                 || {
-                    encode_fixed_subframe(
-                        options,
-                        fixed_cache,
-                        fixed_output,
-                        channel,
-                        bits_per_sample,
-                        wasted_bps,
-                    )
+                    let fixed = fixed_parameters(fixed_cache, channel);
+                    let mut bits = BitsWritten::<u32>::new();
+                    write_fixed_subframe(options, &mut bits, fixed, bits_per_sample, wasted_bps)
+                        .map(|()| (fixed, bits.written()))
                 },
                 || {
-                    encode_lpc_subframe(
+                    LpcSubframeParameters::best(
                         options,
+                        bits_per_sample,
                         max_lpc_order,
                         lpc_cache,
-                        lpc_output,
                         channel,
-                        bits_per_sample,
-                        wasted_bps,
                     )
+                    .and_then(|lpc| {
+                        let mut bits = BitsWritten::<u32>::new();
+                        write_lpc_subframe(options, &mut bits, &lpc, bits_per_sample, wasted_bps)
+                            .map(|()| (lpc, bits.written()))
+                    })
                 },
             ) {
-                (Ok(()), Ok(())) => [fixed_output, lpc_output]
-                    .into_iter()
-                    .min_by_key(|c| c.written())
-                    .unwrap(),
-                (Err(_), Ok(())) => lpc_output,
-                (Ok(()), Err(_)) => fixed_output,
+                (Ok((_, fixed_bits)), Ok((lpc, lpc_bits))) if lpc_bits < fixed_bits => {
+                    write_lpc_subframe(options, lpc_output, &lpc, bits_per_sample, wasted_bps)?;
+                    lpc_output
+                }
+                (Ok((fixed, _)), _) => {
+                    write_fixed_subframe(
+                        options,
+                        fixed_output,
+                        fixed,
+                        bits_per_sample,
+                        wasted_bps,
+                    )?;
+                    fixed_output
+                }
+                (Err(_), Ok((lpc, _))) => {
+                    write_lpc_subframe(options, lpc_output, &lpc, bits_per_sample, wasted_bps)?;
+                    lpc_output
+                }
                 (Err(_), Err(_)) => {
                     verbatim_output.clear();
                     encode_verbatim_subframe(
@@ -3019,19 +3032,27 @@ fn encode_verbatim_subframe<W: BitWrite>(
 
 fn encode_fixed_subframe<W: BitWrite>(
     options: &EncoderOptions,
-    FixedCache {
-        fixed_buffers: buffers,
-    }: &mut FixedCache,
+    cache: &mut FixedCache,
     writer: &mut W,
     channel: &[i32],
     bits_per_sample: SignedBitCount<32>,
     wasted_bps: u32,
 ) -> Result<(), Error> {
-    use crate::stream::{SubframeHeader, SubframeHeaderType};
+    let fixed = fixed_parameters(cache, channel);
+    write_fixed_subframe(options, writer, fixed, bits_per_sample, wasted_bps)
+}
 
+/// The FIXED order for `channel` with the smallest residuals:
+/// the order, its warm-up samples and its residuals
+fn fixed_parameters<'c>(
+    FixedCache {
+        fixed_buffers: buffers,
+    }: &'c mut FixedCache,
+    channel: &'c [i32],
+) -> (u8, &'c [i32], &'c [i32]) {
     // calculate residuals for FIXED subframe orders 0-4
     // (or fewer, if we don't have enough samples)
-    let (order, warm_up, residuals) = {
+    {
         let mut fixed_orders = ArrayVec::<&[i32], 5>::new();
         fixed_orders.push(channel);
 
@@ -3073,7 +3094,17 @@ fn encode_fixed_subframe<W: BitWrite>(
             })
             .map(|(order, residuals)| (order as u8, &channel[0..order], residuals))
             .unwrap()
-    };
+    }
+}
+
+fn write_fixed_subframe<W: BitWrite>(
+    options: &EncoderOptions,
+    writer: &mut W,
+    (order, warm_up, residuals): (u8, &[i32], &[i32]),
+    bits_per_sample: SignedBitCount<32>,
+    wasted_bps: u32,
+) -> Result<(), Error> {
+    use crate::stream::{SubframeHeader, SubframeHeaderType};
 
     writer.build(&SubframeHeader {
         type_: SubframeHeaderType::Fixed { order },
@@ -3087,18 +3118,10 @@ fn encode_fixed_subframe<W: BitWrite>(
     write_residuals(options, writer, order.into(), residuals)
 }
 
-fn encode_lpc_subframe<W: BitWrite>(
+fn write_lpc_subframe<W: BitWrite>(
     options: &EncoderOptions,
-    max_lpc_order: NonZero<u8>,
-    cache: &mut LpcCache,
     writer: &mut W,
-    channel: &[i32],
-    bits_per_sample: SignedBitCount<32>,
-    wasted_bps: u32,
-) -> Result<(), Error> {
-    use crate::stream::{SubframeHeader, SubframeHeaderType};
-
-    let LpcSubframeParameters {
+    LpcSubframeParameters {
         warm_up,
         residuals,
         parameters:
@@ -3108,14 +3131,18 @@ fn encode_lpc_subframe<W: BitWrite>(
                 shift,
                 coefficients,
             },
-    } = LpcSubframeParameters::best(options, bits_per_sample, max_lpc_order, cache, channel)?;
+    }: &LpcSubframeParameters,
+    bits_per_sample: SignedBitCount<32>,
+    wasted_bps: u32,
+) -> Result<(), Error> {
+    use crate::stream::{SubframeHeader, SubframeHeaderType};
 
     writer.build(&SubframeHeader {
-        type_: SubframeHeaderType::Lpc { order },
+        type_: SubframeHeaderType::Lpc { order: *order },
         wasted_bps,
     })?;
 
-    for sample in warm_up {
+    for sample in *warm_up {
         writer.write_signed_counted(bits_per_sample, *sample)?;
     }
 
@@ -3126,10 +3153,10 @@ fn encode_lpc_subframe<W: BitWrite>(
             .ok_or(Error::InvalidQlpPrecision)?,
     )?;
 
-    writer.write::<5, i32>(shift as i32)?;
+    writer.write::<5, i32>(*shift as i32)?;
 
     for coeff in coefficients {
-        writer.write_signed_counted(precision, coeff)?;
+        writer.write_signed_counted(*precision, *coeff)?;
     }
 
     write_residuals(options, writer, order.get().into(), residuals)
