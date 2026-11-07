@@ -3801,16 +3801,12 @@ fn write_residuals<W: BitWrite>(
     }
 
     impl<'r, const RICE_MAX: u32> Partition<'r, RICE_MAX> {
-        fn new(partition: &'r [i32], estimated_bits: &mut u32) -> Option<Self> {
+        /// `partition_sum` is the sum of the residuals' magnitudes
+        fn new(partition: &'r [i32], partition_sum: u64, estimated_bits: &mut u32) -> Option<Self> {
             let partition_samples = partition.len() as u16;
             if partition_samples == 0 {
                 return None;
             }
-
-            let partition_sum = partition
-                .iter()
-                .map(|i| u64::from(i.unsigned_abs()))
-                .sum::<u64>();
 
             if partition_sum > 0 {
                 let rice = if partition_sum > partition_samples.into() {
@@ -3823,14 +3819,7 @@ fn write_residuals<W: BitWrite>(
                     }) {
                         Some(rice) => rice,
                         None => {
-                            let escape_size = (partition
-                                .iter()
-                                .map(|i| u64::from(i.unsigned_abs()))
-                                .sum::<u64>()
-                                .ilog2()
-                                + 2)
-                            .try_into()
-                            .ok()?;
+                            let escape_size = (partition_sum.ilog2() + 2).try_into().ok()?;
 
                             *estimated_bits +=
                                 u32::from(escape_size) * u32::from(partition_samples);
@@ -3908,7 +3897,18 @@ fn write_residuals<W: BitWrite>(
         block_size: usize,
         residuals: &'r [i32],
     ) -> Vec<Partition<'r, RICE_MAX>> {
-        (0..=block_size.trailing_zeros().min(options.max_partition_order))
+        let max_order = block_size.trailing_zeros().min(options.max_partition_order);
+
+        // the residuals' magnitudes summed per partition of the finest order,
+        // from the end as `rchunks` splits them, so that each coarser order
+        // adds up runs of these instead of reading every residual again
+        let finest = block_size >> max_order;
+        let sums: Vec<u64> = residuals
+            .rchunks(finest)
+            .map(|partition| partition.iter().map(|i| u64::from(i.unsigned_abs())).sum())
+            .collect();
+
+        (0..=max_order)
             .map(|partition_order| 1 << partition_order)
             .take_while(|partition_count: &usize| partition_count.is_power_of_two())
             .filter_map(|partition_count| {
@@ -3920,10 +3920,14 @@ fn write_residuals<W: BitWrite>(
                     return None;
                 }
 
+                let partition_size = block_size / partition_count;
                 let partitions = residuals
-                    .rchunks(block_size / partition_count)
+                    .rchunks(partition_size)
+                    .zip(sums.chunks(partition_size / finest))
                     .rev()
-                    .map(|partition| Partition::new(partition, &mut estimated_bits))
+                    .map(|(partition, sums)| {
+                        Partition::new(partition, sums.iter().sum(), &mut estimated_bits)
+                    })
                     .collect::<Option<Vec<_>>>()
                     .filter(|p| !p.is_empty() && p.len().is_power_of_two())?;
 
