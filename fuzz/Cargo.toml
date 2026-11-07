@@ -12,6 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = { version = "0.4.13", features = ["arbitrary-derive"] }
 flac-codec = { path = ".." }
+# the branch before the speed work on decoding, as the reference for `decode_reference`
+flac-codec-reference = { package = "flac-codec", git = "https://github.com/relative23/flac-codec", rev = "69e7537956d340fbeeae9094b156f9b04b2be0e5" }
 
 # not part of a workspace with the crate
 [workspace]
@@ -41,6 +43,13 @@ bench = false
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_reference"
+path = "fuzz_targets/decode_reference.rs"
 test = false
 doc = false
 bench = false
