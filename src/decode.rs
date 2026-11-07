@@ -1397,17 +1397,26 @@ impl<R: std::io::Read> Decoder<R> {
             .blocks
             .streaminfo()
             .total_samples
-            .map(|total| total.get() - self.current_sample)
+            .map(|total| total.get().checked_sub(self.current_sample))
         {
-            Some(0) => return Ok(None),
-            Some(remaining) => FrameHeader::read(crc16_reader.by_ref(), self.blocks.streaminfo())
-                .and_then(|header| {
-                // only the last block in a stream may contain <= 14 samples
-                let block_size = u16::from(header.block_size);
-                (u64::from(block_size) == remaining || block_size > 14)
-                    .then_some(header)
-                    .ok_or(Error::ShortBlock)
-            })?,
+            Some(Some(0)) => return Ok(None),
+            Some(Some(remaining)) => {
+                FrameHeader::read(crc16_reader.by_ref(), self.blocks.streaminfo()).and_then(
+                    |header| {
+                        let block_size = u16::from(header.block_size);
+                        if u64::from(block_size) > remaining {
+                            // a block may not run past the total in STREAMINFO
+                            Err(Error::TooManySamples)
+                        } else if u64::from(block_size) == remaining || block_size > 14 {
+                            // only the last block in a stream may contain <= 14 samples
+                            Ok(header)
+                        } else {
+                            Err(Error::ShortBlock)
+                        }
+                    },
+                )?
+            }
+            Some(None) => return Err(Error::TooManySamples),
             // if total number of remaining samples isn't known,
             // treat an EOF error as the end of stream
             // (this is an uncommon case)
