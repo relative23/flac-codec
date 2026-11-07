@@ -1,0 +1,19 @@
+# cargo-deny policy of the NASTRA branch: what may reach NASTRA through this crate.
+[graph]
+features = ["rayon"]
+
+[advisories]
+# any RustSec advisory fails, including unmaintained and yanked crates
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

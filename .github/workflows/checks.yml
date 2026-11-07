@@ -1,7 +1,8 @@
 # Checks of the NASTRA branch (see PATCHES.md): upstream's tests on four platforms with
 # and without rayon, the minimum Rust version, formatting and clippy against upstream,
-# damaged streams in a release build with overflow checks, and libFLAC and ffmpeg
-# decoding what the encoder writes.
+# damaged streams and random encoder input in a release build with overflow checks,
+# libFLAC and ffmpeg decoding what the encoder writes, cargo deny, and a short round of
+# coverage-guided fuzzing.
 name: checks
 
 on:
@@ -87,6 +88,7 @@ jobs:
       CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
       CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
       HARDENING_ROUNDS: "1000000"
+      ENCODER_ROUNDS: "20000"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,6 +107,33 @@ jobs:
       - run: flac --version && ffmpeg -version | head -1
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo test --release --test hardening reference_decoders_agree -- --ignored --nocapture
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: two minutes per target
+        run: |
+          cd fuzz
+          for target in decode seek metadata roundtrip; do
+            cargo fuzz run "$target" -- -max_total_time=120 -rss_limit_mb=2048 -timeout=10
+          done
 
   upstream-drift:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

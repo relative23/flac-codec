@@ -1,8 +1,8 @@
 # Patches on top of flac-codec 1.3.3
 
 `nastra-1.3.3-hardened` is upstream release 1.3.3 (`a7b1ffb`) plus the commits below,
-in this order, without merges. NASTRA pins an exact commit of this branch, never the
-branch name.
+without merges: the fixes and the fork-only commits, in the order they were made. NASTRA
+pins an exact commit of this branch, never the branch name.
 
 ## Fixes
 
@@ -17,11 +17,13 @@ pull request.
 | `021a487` | Let prediction wrap around instead of overflowing (debug builds) | `fix-prediction-overflow` | also fixed in #4 |
 | `d78a347` | Support partition orders above 6 in the encoder (encoding 2–3 % faster as a side effect) | `fix-encoder-partition-order-limit` | not in #4: issue tuffy/flac-codec#7, PR tuffy/flac-codec#8 (open) |
 | `96ce42e` | Use wrapping arithmetic in stereo decorrelation (debug builds; decoding to samples about 4 % faster, no change with MD5 verification) | `fix-stereo-decorrelation-overflow` | also fixed in #4 |
+| `65abdc8` | Never write fewer residual partitions than the partition order says (the encoder wrote streams no decoder can read, e.g. with the default options for a last block of 4 samples) | `fix-encoder-short-block-partitions` | also fixed in #4 (its commit `2503845`); not reported separately |
+| `ebfd19b` | Allow LPC order 32 in debug builds (a debug assertion rejected the highest order the options accept) | `fix-lpc-order-32-debug-assertion` | not in #4; not reported yet |
 
 ## Fork only
 
-`PATCHES.md`, `tests/hardening.rs` and `.github/workflows/checks.yml`. They are not
-part of any upstream pull request.
+`PATCHES.md`, `tests/hardening.rs`, `tests/memory.rs`, `deny.toml`, `fuzz/` and
+`.github/workflows/checks.yml`. They are not part of any upstream pull request.
 
 `tests/hardening.rs`:
 
@@ -31,10 +33,28 @@ part of any upstream pull request.
 - `damaged_streams_never_panic`: bit flips, truncation and garbage in the metadata and
   frames, with a fixed seed. `HARDENING_ROUNDS` sets the count (3,000 by default; CI
   runs 1,000,000 in a release build with overflow checks).
+- `encoder_random_inputs_round_trip`: random bit depths, channel counts, rates up to
+  1,048,575 Hz, lengths, block sizes, LPC and partition orders, windows (also NaN,
+  negative and infinite Tukey parameters), seek tables and padding, ten kinds of
+  signal, written in random pieces; every stream must decode to its input.
+  `ENCODER_ROUNDS` sets the count (200 by default; CI runs 20,000 in a release build
+  with overflow checks and debug assertions). `HARDENING_DUMP=<dir>` keeps the input
+  and the stream of every failure.
 - `reference_decoders_agree` (ignored by default; needs `flac` and `ffmpeg`): libFLAC's
   `flac --test` accepts every stream (frame CRCs and MD5), and libFLAC and ffmpeg decode
   the same samples that were encoded. 288 streams: 8 to 32 bits, 1, 2 and 6 channels,
   44.1 to 384 kHz.
+
+`tests/memory.rs` counts heap use while decoding: damaged streams, and hostile metadata
+(16 MiB blocks, a comment count of 4 billion, strings and pictures claiming 4 GiB).
+
+`deny.toml` is the `cargo deny` policy: no RustSec advisory (unmaintained and yanked
+crates included), MIT or Apache-2.0 only, one version per crate, crates.io only.
+
+`fuzz/` holds the cargo-fuzz targets `decode` (samples and MD5), `seek`, `metadata`
+(every block that reads must write back and read again unchanged) and `roundtrip`
+(any samples, layout and options must encode and decode to the same samples):
+`cargo +nightly fuzz run <target>`.
 
 ## Moving to a new upstream release
 
@@ -42,7 +62,7 @@ part of any upstream pull request.
 2. For each fix, run its regression test on the release without the fix. If it passes,
    upstream has fixed it: drop the commit and note the upstream commit here.
    Otherwise cherry-pick it.
-3. Cherry-pick the fork-only commit and update `UPSTREAM_BASE` in the workflow.
+3. Cherry-pick the fork-only commits and update `UPSTREAM_BASE` in the workflow.
 4. When all checks pass, NASTRA moves its pin to the new commit.
 
 ## Evidence (2026-11-07, x86_64 Linux, Rust 1.99.1)
@@ -58,7 +78,18 @@ part of any upstream pull request.
 - Encoder output is byte-identical to upstream 1.3.3 for the default, fast and best
   settings on 15 test files and on the 64 IETF subset files.
 - The upstream test suite passes with and without `rayon`, on stable and on Rust 1.88.
-  clippy reports 18 warnings, the same as upstream 1.3.3.
+  clippy reports as many warnings as on upstream 1.3.3 (counted from its JSON output).
+- `encoder_random_inputs_round_trip` found the last two fixes: within 200 rounds a
+  stream no decoder could read (flac-codec, libFLAC 1.5.0 and ffmpeg 8.0.1 all reject
+  it; upstream 1.3.3 writes the same stream), and with debug assertions the order-32
+  panic. With both fixes: 20,000 rounds clean with overflow checks and debug
+  assertions. Encoder output for the 64 IETF subset files is unchanged by them.
+- Heap peaks (`tests/memory.rs`): below 0.1 MiB for the clean and the 2,000 damaged
+  streams and for every claim of 4 billion entries or 4 GiB (they fail cleanly); 16 MiB
+  for a 16 MiB application block, 21.4 MiB for a 16 MiB seek table, and 96 MiB for a
+  16 MiB comment block of 4.2 million empty comments, the largest factor (a stream may
+  hold one comment block, so about 100 MB is the most it can cost).
+- `cargo deny check`: advisories, bans, licenses and sources ok.
 
 ## Speed (2026-11-07, one pinned core, 64 IETF subset files with 98.6 million samples)
 

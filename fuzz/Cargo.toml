@@ -1,0 +1,46 @@
+# Coverage-guided fuzzing of the NASTRA branch (see ../PATCHES.md), with cargo-fuzz:
+#   cargo +nightly fuzz run <target> -- -max_total_time=600
+[package]
+name = "flac-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4.13", features = ["arbitrary-derive"] }
+flac-codec = { path = ".." }
+
+# not part of a workspace with the crate
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seek"
+path = "fuzz_targets/seek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false

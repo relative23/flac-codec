@@ -190,6 +190,139 @@ fn damaged_streams_never_panic() {
     assert!(panics.is_empty(), "panics in rounds {panics:?}");
 }
 
+/// Interleaved samples of a randomly chosen kind, including the edges of the range.
+fn random_signal(rng: &mut Rng, bits: u32, channels: usize, frames: usize) -> Vec<i32> {
+    let max = (1i64 << (bits - 1)) - 1;
+    let min = -(1i64 << (bits - 1));
+    let full = |rng: &mut Rng| min + (rng.next() % (max - min + 1) as u64) as i64;
+    let kind = rng.below(10);
+    let level = full(rng);
+    let shift = rng.below(bits as usize - 1) as u32;
+    let mut walk = vec![0i64; channels];
+    let mut out: Vec<i32> = Vec::with_capacity(frames * channels);
+    for n in 0..frames {
+        for c in 0..channels {
+            let v = match kind {
+                0 => ((n as f64 * (0.001 + 0.05 * c as f64)).sin() * max as f64) as i64,
+                1 => full(rng),
+                2 => [max, min][(n + c) % 2],
+                3 => level,
+                4 if rng.below(97) == 0 => full(rng),
+                4 => 0,
+                5 => rng.below(3) as i64 - 1,
+                // wasted bits: the low bits of every sample are zero
+                6 => (full(rng) >> shift) << shift,
+                7 => {
+                    walk[c] = (walk[c] + full(rng) / 64).clamp(min, max);
+                    walk[c]
+                }
+                // channels that are copies or inversions of the first
+                8 if c > 0 => i64::from(out[out.len() - c]),
+                9 if c > 0 => -i64::from(out[out.len() - c]),
+                _ => full(rng),
+            };
+            out.push(v.clamp(min, max) as i32);
+        }
+    }
+    out
+}
+
+/// Random layouts, rates, lengths, block sizes, options and signals, written in random
+/// pieces: the encoder must never panic, and every stream must decode to its input.
+#[test]
+fn encoder_random_inputs_round_trip() {
+    use flac_codec::encode::Window;
+
+    // ENCODER_ROUNDS raises the count (CI runs a release build with many more)
+    let rounds: usize = std::env::var("ENCODER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let mut rng = Rng(0x00E4_C0DE_5EED);
+    let mut failures = vec![];
+    for round in 0..rounds {
+        let bits = 4 + rng.below(29) as u32;
+        let channels = 1 + rng.below(8) as u8;
+        let rate = match rng.below(3) {
+            0 => [8000, 44100, 48000, 96000, 192000, 384000][rng.below(6)],
+            _ => 1 + rng.below(1_048_575) as u32,
+        };
+        let block = match rng.below(3) {
+            0 => [16, 192, 576, 1152, 4096, 4608, 16384, 32768, 65535][rng.below(9)],
+            _ => 16 + rng.below(65520) as u16,
+        };
+        let frames = match rng.below(4) {
+            0 => rng.below(40),
+            // around a multiple of the block size
+            1 => (usize::from(block) * (1 + rng.below(3)) + rng.below(3)).saturating_sub(1),
+            _ => rng.below(30000),
+        };
+        let window = match rng.below(5) {
+            0 => Window::Rectangle,
+            1 => Window::Hann,
+            2 => Window::Tukey(rng.below(1001) as f32 / 1000.0),
+            3 => Window::Tukey([f32::NAN, -1.0, 2.0, f32::INFINITY, 0.0, 1.0][rng.below(6)]),
+            _ => Window::default(),
+        };
+        let mut options = Options::default()
+            .block_size(block)
+            .unwrap()
+            .max_lpc_order([None, Some(1 + rng.below(32) as u8)][rng.below(4).min(1)])
+            .unwrap()
+            .max_partition_order(rng.below(16) as u32)
+            .unwrap()
+            .mid_side(rng.below(2) == 0)
+            .fast_channel_correlation(rng.below(2) == 0)
+            .window(window);
+        if rng.below(2) == 0 {
+            options = options.no_padding();
+        }
+        match rng.below(3) {
+            0 => options = options.no_seektable(),
+            1 => options = options.seektable_frames(1 + rng.below(100)),
+            _ => {}
+        }
+        let samples = random_signal(&mut rng, bits, channels.into(), frames);
+        let total = (frames > 0 && rng.below(2) == 0).then_some(samples.len() as u64);
+        let piece = usize::from(channels) * (1 + rng.below(5000));
+        let config = format!(
+            "round {round}: {bits} bit, {channels} ch, {rate} Hz, {frames} frames, \
+             total {total:?}, pieces of {piece}, {options:?}"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut flac = Cursor::new(vec![]);
+            let mut writer = FlacSampleWriter::new(&mut flac, options, rate, bits, channels, total)
+                .map_err(|e| format!("new: {e}"))?;
+            for p in samples.chunks(piece) {
+                writer.write(p).map_err(|e| format!("write: {e}"))?;
+            }
+            writer.finalize().map_err(|e| format!("finalize: {e}"))?;
+            let flac = flac.into_inner();
+            let checked = match decode(&flac) {
+                Ok(decoded) if decoded == samples => Ok(()),
+                Ok(_) => Err("decoded samples differ".to_string()),
+                Err(e) => Err(format!("decode: {e}")),
+            };
+            // HARDENING_DUMP=<dir> keeps every stream that failed, for other decoders
+            if let (Err(_), Ok(dir)) = (&checked, std::env::var("HARDENING_DUMP")) {
+                std::fs::write(format!("{dir}/encoder-round-{round}.flac"), &flac).unwrap();
+                let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/encoder-round-{round}.s32"), pcm).unwrap();
+            }
+            checked
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            // FLAC cannot describe an empty stream
+            Ok(Err(_)) if frames == 0 => {}
+            Ok(Err(e)) => failures.push(format!("{config}: {e}")),
+            Err(_) => failures.push(format!("{config}: panic")),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Decodes `flac` with an external program into signed 32-bit little-endian samples,
 /// shifted back to `bits`.
 fn external(program: &str, args: &[&str], raw: &std::path::Path, bits: u32) -> Vec<i32> {
