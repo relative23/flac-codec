@@ -73,11 +73,6 @@ impl<W, C: Checksum> CrcWriter<W, C> {
     pub fn checksum(&self) -> C {
         self.checksum
     }
-
-    /// Consumes self and returns writer
-    pub fn into_writer(self) -> W {
-        self.writer
-    }
 }
 
 impl<W: std::io::Write, C: Checksum> std::io::Write for CrcWriter<W, C> {

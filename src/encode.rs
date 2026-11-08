@@ -26,9 +26,7 @@ use crate::stream::{
 };
 use crate::{Counter, Error};
 use arrayvec::ArrayVec;
-use bitstream_io::{
-    BigEndian, BitCount, BitRecorder, BitWrite, BitWriter, BitsWritten, SignedBitCount, ToBitStream,
-};
+use bitstream_io::{BitCount, BitWrite, BitsWritten, SignedBitCount};
 use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZero;
@@ -1102,7 +1100,6 @@ impl<W: std::io::Write> FlacStreamWriter<W> {
         bits_per_sample: u32,
         samples: &[i32],
     ) -> Result<(), Error> {
-        use crate::crc::{Crc16, CrcWriter};
         use crate::stream::{BitsPerSample, FrameHeader, SampleRate};
 
         let bits_per_sample: SignedBitCount<32> = bits_per_sample
@@ -1140,50 +1137,25 @@ impl<W: std::io::Write> FlacStreamWriter<W> {
             bps => bps,
         };
 
-        let mut w: CrcWriter<_, Crc16> = CrcWriter::new(&mut self.writer);
-        let mut bw: BitWriter<CrcWriter<&mut W, Crc16>, BigEndian>;
-
-        match self
+        let channels = self
             .frame
             .channels()
-            .collect::<ArrayVec<&[i32], MAX_CHANNELS>>()
-            .as_slice()
-        {
-            [channel] => {
-                FrameHeader {
-                    blocking_strategy: false,
-                    frame_number: self.frame_number,
-                    block_size: (channel.len() as u16)
-                        .try_into()
-                        .expect("frame cannot be empty"),
-                    sample_rate,
-                    bits_per_sample: header_bits_per_sample,
-                    channel_assignment: ChannelAssignment::Independent(Independent::Mono),
-                }
-                .write_subset(&mut w)?;
-
-                bw = BitWriter::new(w);
-
-                self.caches.channels.resize_with(1, ChannelCache::default);
-
-                encode_subframe(
-                    &self.options,
-                    &mut self.caches.channels[0],
-                    CorrelatedChannel::independent(bits_per_sample, channel),
-                )?
-                .playback(&mut bw)?;
-            }
-            [left, right] if self.options.exhaustive_channel_correlation => {
-                let Correlated {
-                    channel_assignment,
-                    channels: [channel_0, channel_1],
-                } = correlate_channels_exhaustive(
-                    &self.options,
-                    &mut self.caches.correlated,
-                    [left, right],
-                    bits_per_sample,
-                )?;
-
+            .collect::<ArrayVec<&[i32], MAX_CHANNELS>>();
+        let EncodingCaches {
+            channels: caches,
+            correlated,
+            frame: buf,
+        } = &mut self.caches;
+        let (channel_assignment, plans) = plan_frame(
+            &self.options,
+            caches,
+            correlated,
+            &channels,
+            bits_per_sample,
+        )?;
+        write_frame_bytes(
+            buf,
+            |header| {
                 FrameHeader {
                     blocking_strategy: false,
                     frame_number: self.frame_number,
@@ -1192,83 +1164,11 @@ impl<W: std::io::Write> FlacStreamWriter<W> {
                     bits_per_sample: header_bits_per_sample,
                     channel_assignment,
                 }
-                .write_subset(&mut w)?;
-
-                bw = BitWriter::new(w);
-
-                channel_0.playback(&mut bw)?;
-                channel_1.playback(&mut bw)?;
-            }
-            [left, right] => {
-                let Correlated {
-                    channel_assignment,
-                    channels: [channel_0, channel_1],
-                } = correlate_channels(
-                    &self.options,
-                    &mut self.caches.correlated,
-                    [left, right],
-                    bits_per_sample,
-                );
-
-                FrameHeader {
-                    blocking_strategy: false,
-                    frame_number: self.frame_number,
-                    block_size,
-                    sample_rate,
-                    bits_per_sample: header_bits_per_sample,
-                    channel_assignment,
-                }
-                .write_subset(&mut w)?;
-
-                self.caches.channels.resize_with(2, ChannelCache::default);
-                let [cache_0, cache_1] = self.caches.channels.get_disjoint_mut([0, 1]).unwrap();
-                let (channel_0, channel_1) = join(
-                    || encode_subframe(&self.options, cache_0, channel_0),
-                    || encode_subframe(&self.options, cache_1, channel_1),
-                );
-
-                bw = BitWriter::new(w);
-
-                channel_0?.playback(&mut bw)?;
-                channel_1?.playback(&mut bw)?;
-            }
-            channels => {
-                // non-stereo frames are always encoded independently
-                FrameHeader {
-                    blocking_strategy: false,
-                    frame_number: self.frame_number,
-                    block_size,
-                    sample_rate,
-                    bits_per_sample: header_bits_per_sample,
-                    channel_assignment: ChannelAssignment::Independent(
-                        channels.len().try_into().expect("invalid channel count"),
-                    ),
-                }
-                .write_subset(&mut w)?;
-
-                bw = BitWriter::new(w);
-
-                self.caches
-                    .channels
-                    .resize_with(channels.len(), ChannelCache::default);
-
-                vec_map(
-                    self.caches.channels.iter_mut().zip(channels).collect(),
-                    |(cache, channel)| {
-                        encode_subframe(
-                            &self.options,
-                            cache,
-                            CorrelatedChannel::independent(bits_per_sample, channel),
-                        )
-                    },
-                )
-                .into_iter()
-                .try_for_each(|r| r.and_then(|r| r.playback(bw.by_ref()).map_err(Error::Io)))?;
-            }
-        }
-
-        let crc16: u16 = bw.aligned_writer()?.checksum().into();
-        bw.write_from(crc16)?;
+                .write_subset(header)
+            },
+            &plans,
+        )?;
+        self.writer.write_all(buf)?;
 
         if self.frame_number.try_increment().is_err() {
             self.frame_number = FrameNumber::default();
@@ -1815,6 +1715,8 @@ impl Default for Window {
 struct EncodingCaches {
     channels: Vec<ChannelCache>,
     correlated: CorrelationCache,
+    // the frame being written
+    frame: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -1835,8 +1737,6 @@ struct ChannelCache {
     fixed: FixedCache,
     lpc: LpcCache,
     wasted: Vec<i32>,
-    // the chosen subframe, written
-    output: BitRecorder<u32, BigEndian>,
 }
 
 /// The parts of a channel cache a subframe plan borrows
@@ -1847,15 +1747,10 @@ struct Planning<'c> {
 }
 
 impl ChannelCache {
-    /// What planning borrows, and the output to write the plan into
-    fn split(&mut self) -> (Planning<'_>, &mut BitRecorder<u32, BigEndian>) {
-        let ChannelCache {
-            fixed,
-            lpc,
-            wasted,
-            output,
-        } = self;
-        (Planning { fixed, lpc, wasted }, output)
+    /// What planning borrows
+    fn planning(&mut self) -> Planning<'_> {
+        let ChannelCache { fixed, lpc, wasted } = self;
+        Planning { fixed, lpc, wasted }
     }
 }
 
@@ -2278,6 +2173,103 @@ pub fn generate_seektable<R: std::io::Read>(
     })
 }
 
+/// Plans the subframes of a frame: the channel assignment, then one plan
+/// per subframe in the order they are written
+fn plan_frame<'c>(
+    options: &EncoderOptions,
+    caches: &'c mut Vec<ChannelCache>,
+    correlated: &'c mut CorrelationCache,
+    frame: &[&'c [i32]],
+    bits_per_sample: SignedBitCount<32>,
+) -> Result<(ChannelAssignment, ArrayVec<SubframePlan<'c>, MAX_CHANNELS>), Error> {
+    match frame {
+        [channel] => {
+            caches.resize_with(1, ChannelCache::default);
+            let plan = plan_subframe(
+                options,
+                caches[0].planning(),
+                CorrelatedChannel::independent(bits_per_sample, channel),
+            )?;
+            Ok((
+                ChannelAssignment::Independent(Independent::Mono),
+                [plan].into_iter().collect(),
+            ))
+        }
+        [left, right] if options.exhaustive_channel_correlation => {
+            let Correlated {
+                channel_assignment,
+                channels,
+            } = correlate_channels_exhaustive(options, correlated, [left, right], bits_per_sample)?;
+            Ok((channel_assignment, channels.into_iter().collect()))
+        }
+        [left, right] => {
+            let Correlated {
+                channel_assignment,
+                channels: [channel_0, channel_1],
+            } = correlate_channels(options, correlated, [left, right], bits_per_sample);
+
+            caches.resize_with(2, ChannelCache::default);
+            let [cache_0, cache_1] = caches.get_disjoint_mut([0, 1]).unwrap();
+            let (plan_0, plan_1) = try_join(
+                || plan_subframe(options, cache_0.planning(), channel_0),
+                || plan_subframe(options, cache_1.planning(), channel_1),
+            )?;
+            Ok((channel_assignment, [plan_0, plan_1].into_iter().collect()))
+        }
+        channels => {
+            // non-stereo frames are always encoded independently
+            caches.resize_with(channels.len(), ChannelCache::default);
+            let plans = vec_map(
+                caches.iter_mut().zip(channels).collect(),
+                |(cache, channel)| {
+                    plan_subframe(
+                        options,
+                        cache.planning(),
+                        CorrelatedChannel::independent(bits_per_sample, channel),
+                    )
+                },
+            )
+            .into_iter()
+            .collect::<Result<ArrayVec<_, MAX_CHANNELS>, Error>>()?;
+            Ok((
+                ChannelAssignment::Independent(
+                    channels.len().try_into().expect("invalid channel count"),
+                ),
+                plans,
+            ))
+        }
+    }
+}
+
+/// Writes a whole frame into `buf`, replacing what it held: the header
+/// (written by `header`), the planned subframes, and the CRC-16
+fn write_frame_bytes(
+    buf: &mut Vec<u8>,
+    header: impl FnOnce(&mut Vec<u8>) -> Result<(), Error>,
+    plans: &[SubframePlan<'_>],
+) -> Result<(), Error> {
+    use crate::crc::Crc16;
+    use crate::frames::FrameWriter;
+
+    buf.clear();
+    header(buf)?;
+    let mut writer = FrameWriter::new(buf);
+    for plan in plans {
+        let before = writer.bit_len();
+        plan.write(&mut writer)?;
+        debug_assert_eq!(
+            writer.bit_len() - before,
+            u64::from(plan.bits),
+            "planned and written sizes differ"
+        );
+    }
+    writer.byte_align()?;
+    let buf = writer.finish();
+    let crc16: u16 = Crc16::default().update_slice(buf).into();
+    buf.extend_from_slice(&crc16.to_be_bytes());
+    Ok(())
+}
+
 fn encode_frame<W>(
     options: &EncoderOptions,
     cache: &mut EncodingCaches,
@@ -2290,53 +2282,25 @@ fn encode_frame<W>(
 where
     W: std::io::Write,
 {
-    use crate::Counter;
-    use crate::crc::{Crc16, CrcWriter};
     use crate::stream::FrameHeader;
-    use bitstream_io::BigEndian;
 
     debug_assert!(!frame.is_empty());
 
-    let size = Counter::new(writer.by_ref());
-    let mut w: CrcWriter<_, Crc16> = CrcWriter::new(size);
-    let mut bw: BitWriter<CrcWriter<Counter<&mut W>, Crc16>, BigEndian>;
-
-    match frame.as_slice() {
-        [channel] => {
-            FrameHeader {
-                blocking_strategy: false,
-                frame_number: *frame_number,
-                block_size: (channel.len() as u16)
-                    .try_into()
-                    .expect("frame cannot be empty"),
-                sample_rate,
-                bits_per_sample: streaminfo.bits_per_sample.into(),
-                channel_assignment: ChannelAssignment::Independent(Independent::Mono),
-            }
-            .write(&mut w, streaminfo)?;
-
-            bw = BitWriter::new(w);
-
-            cache.channels.resize_with(1, ChannelCache::default);
-
-            encode_subframe(
-                options,
-                &mut cache.channels[0],
-                CorrelatedChannel::independent(streaminfo.bits_per_sample, channel),
-            )?
-            .playback(&mut bw)?;
-        }
-        [left, right] if options.exhaustive_channel_correlation => {
-            let Correlated {
-                channel_assignment,
-                channels: [channel_0, channel_1],
-            } = correlate_channels_exhaustive(
-                options,
-                &mut cache.correlated,
-                [left, right],
-                streaminfo.bits_per_sample,
-            )?;
-
+    let EncodingCaches {
+        channels: caches,
+        correlated,
+        frame: buf,
+    } = cache;
+    let (channel_assignment, plans) = plan_frame(
+        options,
+        caches,
+        correlated,
+        &frame,
+        streaminfo.bits_per_sample,
+    )?;
+    write_frame_bytes(
+        buf,
+        |header| {
             FrameHeader {
                 blocking_strategy: false,
                 frame_number: *frame_number,
@@ -2347,93 +2311,16 @@ where
                 bits_per_sample: streaminfo.bits_per_sample.into(),
                 channel_assignment,
             }
-            .write(&mut w, streaminfo)?;
-
-            bw = BitWriter::new(w);
-
-            channel_0.playback(&mut bw)?;
-            channel_1.playback(&mut bw)?;
-        }
-        [left, right] => {
-            let Correlated {
-                channel_assignment,
-                channels: [channel_0, channel_1],
-            } = correlate_channels(
-                options,
-                &mut cache.correlated,
-                [left, right],
-                streaminfo.bits_per_sample,
-            );
-
-            FrameHeader {
-                blocking_strategy: false,
-                frame_number: *frame_number,
-                block_size: (frame[0].len() as u16)
-                    .try_into()
-                    .expect("frame cannot be empty"),
-                sample_rate,
-                bits_per_sample: streaminfo.bits_per_sample.into(),
-                channel_assignment,
-            }
-            .write(&mut w, streaminfo)?;
-
-            cache.channels.resize_with(2, ChannelCache::default);
-            let [cache_0, cache_1] = cache.channels.get_disjoint_mut([0, 1]).unwrap();
-            let (channel_0, channel_1) = join(
-                || encode_subframe(options, cache_0, channel_0),
-                || encode_subframe(options, cache_1, channel_1),
-            );
-
-            bw = BitWriter::new(w);
-
-            channel_0?.playback(&mut bw)?;
-            channel_1?.playback(&mut bw)?;
-        }
-        channels => {
-            // non-stereo frames are always encoded independently
-
-            FrameHeader {
-                blocking_strategy: false,
-                frame_number: *frame_number,
-                block_size: (channels[0].len() as u16)
-                    .try_into()
-                    .expect("frame cannot be empty"),
-                sample_rate,
-                bits_per_sample: streaminfo.bits_per_sample.into(),
-                channel_assignment: ChannelAssignment::Independent(
-                    frame.len().try_into().expect("invalid channel count"),
-                ),
-            }
-            .write(&mut w, streaminfo)?;
-
-            bw = BitWriter::new(w);
-
-            cache
-                .channels
-                .resize_with(channels.len(), ChannelCache::default);
-
-            vec_map(
-                cache.channels.iter_mut().zip(channels).collect(),
-                |(cache, channel)| {
-                    encode_subframe(
-                        options,
-                        cache,
-                        CorrelatedChannel::independent(streaminfo.bits_per_sample, channel),
-                    )
-                },
-            )
-            .into_iter()
-            .try_for_each(|r| r.and_then(|r| r.playback(bw.by_ref()).map_err(Error::Io)))?;
-        }
-    }
-
-    let crc16: u16 = bw.aligned_writer()?.checksum().into();
-    bw.write_from(crc16)?;
+            .write(header, streaminfo)
+        },
+        &plans,
+    )?;
+    writer.write_all(buf)?;
 
     frame_number.try_increment()?;
 
     // update minimum and maximum frame size values
-    if let s @ Some(size) = u32::try_from(bw.into_writer().into_writer().count)
+    if let s @ Some(size) = u32::try_from(buf.len())
         .ok()
         .filter(|size| *size < Streaminfo::MAX_FRAME_SIZE)
         .and_then(NonZero::new)
@@ -2708,10 +2595,10 @@ fn correlate_channels_exhaustive<'c>(
     }: &'c mut CorrelationCache,
     [left, right]: [&'c [i32]; 2],
     bits_per_sample: SignedBitCount<32>,
-) -> Result<Correlated<&'c BitRecorder<u32, BigEndian>>, Error> {
-    // every candidate channel is planned; only the two chosen are written
-    let (left_planning, left_output) = left_cache.split();
-    let (right_planning, right_output) = right_cache.split();
+) -> Result<Correlated<SubframePlan<'c>>, Error> {
+    // every candidate channel is planned; only the two chosen are written later
+    let left_planning = left_cache.planning();
+    let right_planning = right_cache.planning();
     let (left_plan, right_plan) = try_join(
         || {
             plan_subframe(
@@ -2756,8 +2643,8 @@ fn correlate_channels_exhaustive<'c>(
 
     match bits_per_sample.checked_add::<32>(1) {
         Some(difference_bits_per_sample) if options.mid_side => {
-            let (average_planning, average_output) = average_cache.split();
-            let (difference_planning, difference_output) = difference_cache.split();
+            let average_planning = average_cache.planning();
+            let difference_planning = difference_cache.planning();
             let (average_plan, difference_plan) = try_join(
                 move || {
                     average_samples.clear();
@@ -2808,36 +2695,24 @@ fn correlate_channels_exhaustive<'c>(
             {
                 channel_assignment @ ChannelAssignment::LeftSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        left_plan.record(left_output)?,
-                        difference_plan.record(difference_output)?,
-                    ],
+                    channels: [left_plan, difference_plan],
                 }),
                 channel_assignment @ ChannelAssignment::SideRight => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        difference_plan.record(difference_output)?,
-                        right_plan.record(right_output)?,
-                    ],
+                    channels: [difference_plan, right_plan],
                 }),
                 channel_assignment @ ChannelAssignment::MidSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        average_plan.record(average_output)?,
-                        difference_plan.record(difference_output)?,
-                    ],
+                    channels: [average_plan, difference_plan],
                 }),
                 channel_assignment @ ChannelAssignment::Independent(_) => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        left_plan.record(left_output)?,
-                        right_plan.record(right_output)?,
-                    ],
+                    channels: [left_plan, right_plan],
                 }),
             }
         }
         Some(difference_bits_per_sample) => {
-            let (difference_planning, difference_output) = difference_cache.split();
+            let difference_planning = difference_cache.planning();
             let difference_plan = difference(
                 difference_samples,
                 difference_planning,
@@ -2865,25 +2740,16 @@ fn correlate_channels_exhaustive<'c>(
             {
                 channel_assignment @ ChannelAssignment::LeftSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        left_plan.record(left_output)?,
-                        difference_plan.record(difference_output)?,
-                    ],
+                    channels: [left_plan, difference_plan],
                 }),
                 channel_assignment @ ChannelAssignment::SideRight => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        difference_plan.record(difference_output)?,
-                        right_plan.record(right_output)?,
-                    ],
+                    channels: [difference_plan, right_plan],
                 }),
                 ChannelAssignment::MidSide => unreachable!(),
                 channel_assignment @ ChannelAssignment::Independent(_) => Ok(Correlated {
                     channel_assignment,
-                    channels: [
-                        left_plan.record(left_output)?,
-                        right_plan.record(right_output)?,
-                    ],
+                    channels: [left_plan, right_plan],
                 }),
             }
         }
@@ -2893,10 +2759,7 @@ fn correlate_channels_exhaustive<'c>(
 
             Ok(Correlated {
                 channel_assignment: ChannelAssignment::Independent(Independent::Stereo),
-                channels: [
-                    left_plan.record(left_output)?,
-                    right_plan.record(right_output)?,
-                ],
+                channels: [left_plan, right_plan],
             })
         }
     }
@@ -2933,7 +2796,7 @@ enum SubframeKind<'c> {
 }
 
 impl SubframePlan<'_> {
-    fn write<W: BitWrite>(&self, writer: &mut W) -> Result<(), Error> {
+    fn write<W: WriteRice>(&self, writer: &mut W) -> Result<(), Error> {
         match &self.kind {
             SubframeKind::Constant {
                 sample,
@@ -2963,21 +2826,6 @@ impl SubframePlan<'_> {
                 residuals.write(writer)
             }
         }
-    }
-
-    /// Writes the subframe into `output`, replacing what it held
-    fn record<'o>(
-        &self,
-        output: &'o mut BitRecorder<u32, BigEndian>,
-    ) -> Result<&'o BitRecorder<u32, BigEndian>, Error> {
-        output.clear();
-        self.write(output)?;
-        debug_assert_eq!(
-            output.written(),
-            self.bits,
-            "planned and written sizes differ"
-        );
-        Ok(output)
     }
 }
 
@@ -3132,15 +2980,6 @@ fn plan_subframe<'c>(
     } else {
         verbatim(channel, bits_per_sample, wasted_bps)
     }
-}
-
-fn encode_subframe<'c>(
-    options: &EncoderOptions,
-    cache: &'c mut ChannelCache,
-    channel: CorrelatedChannel<'_>,
-) -> Result<&'c BitRecorder<u32, BigEndian>, Error> {
-    let (planning, output) = cache.split();
-    plan_subframe(options, planning, channel)?.record(output)
 }
 
 fn encode_constant_subframe<W: BitWrite>(
@@ -4149,35 +3988,68 @@ impl<'r, const RICE_MAX: u32> Partition<'r, RICE_MAX> {
     }
 }
 
-impl<const RICE_MAX: u32> ToBitStream for Partition<'_, RICE_MAX> {
-    type Error = std::io::Error;
-
+/// Bit writers that write Rice codes
+///
+/// The provided method writes the unary count and the remaining bits
+/// separately; the frame writer writes the whole code in one go.
+trait WriteRice: BitWrite {
+    /// Writes `folded` (a zigzag-folded residual) as a Rice code with
+    /// parameter `rice`
     #[inline]
-    fn to_writer<W: BitWrite + ?Sized>(&self, w: &mut W) -> Result<(), Self::Error> {
-        w.build(&self.header)?;
-        match self.header {
-            ResidualPartitionHeader::Standard { rice } => {
-                let mask = rice.mask_lsb();
+    fn write_rice<const RICE_MAX: u32>(
+        &mut self,
+        rice: BitCount<RICE_MAX>,
+        folded: u32,
+    ) -> std::io::Result<()> {
+        let (msb, lsb) = rice.mask_lsb()(folded);
+        self.write_unary::<1>(msb)?;
+        self.write_checked(lsb)
+    }
+}
 
-                self.residuals.iter().try_for_each(|s| {
-                    let (msb, lsb) = mask(if s.is_negative() {
+impl WriteRice for BitsWritten<u32> {}
+
+impl WriteRice for crate::frames::FrameWriter<'_> {
+    #[inline]
+    fn write_rice<const RICE_MAX: u32>(
+        &mut self,
+        rice: BitCount<RICE_MAX>,
+        folded: u32,
+    ) -> std::io::Result<()> {
+        self.rice(u32::from(rice), folded);
+        Ok(())
+    }
+}
+
+/// Writes a partition's header and residuals
+#[inline]
+fn write_partition<const RICE_MAX: u32, W: WriteRice>(
+    w: &mut W,
+    partition: &Partition<'_, RICE_MAX>,
+) -> Result<(), std::io::Error> {
+    w.build(&partition.header)?;
+    match partition.header {
+        ResidualPartitionHeader::Standard { rice } => {
+            partition.residuals.iter().try_for_each(|s| {
+                w.write_rice(
+                    rice,
+                    if s.is_negative() {
                         ((s.unsigned_abs() - 1) << 1) + 1
                     } else {
                         (*s as u32) << 1
-                    });
-                    w.write_unary::<1>(msb)?;
-                    w.write_checked(lsb)
-                })?;
-            }
-            ResidualPartitionHeader::Escaped { escape_size } => {
-                self.residuals
-                    .iter()
-                    .try_for_each(|s| w.write_signed_counted(escape_size, *s))?;
-            }
-            ResidualPartitionHeader::Constant => { /* nothing left to do */ }
+                    },
+                )
+            })?;
         }
-        Ok(())
+        ResidualPartitionHeader::Escaped { escape_size } => {
+            partition
+                .residuals
+                .iter()
+                .try_for_each(|s| w.write_signed_counted(escape_size, *s))?;
+        }
+        ResidualPartitionHeader::Constant => { /* nothing left to do */ }
     }
+    Ok(())
 }
 
 // a partition order of up to 15 allows 32768 partitions,
@@ -4236,13 +4108,13 @@ fn best_partitions<'r, const RICE_MAX: u32>(
         })
 }
 
-fn write_partitions<const RICE_MAX: u32, W: BitWrite>(
+fn write_partitions<const RICE_MAX: u32, W: WriteRice>(
     writer: &mut W,
     partitions: &[Partition<'_, RICE_MAX>],
 ) -> Result<(), Error> {
     writer.write::<4, u32>(partitions.len().ilog2())?; // partition order
     for partition in partitions {
-        writer.build(partition)?;
+        write_partition(writer, partition)?;
     }
     Ok(())
 }
@@ -4293,7 +4165,7 @@ impl CodingMethod<'_> {
         )
     }
 
-    fn write<W: BitWrite>(&self, writer: &mut W) -> Result<(), Error> {
+    fn write<W: WriteRice>(&self, writer: &mut W) -> Result<(), Error> {
         match self {
             Self::Rice(partitions) => {
                 writer.write::<2, u8>(0)?; // coding method 0

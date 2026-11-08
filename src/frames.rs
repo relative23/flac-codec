@@ -4,7 +4,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Decoding frames from memory
+//! Decoding frames from memory, and writing them into memory
 //!
 //! The decoder reads its stream ahead into a [`ReadAhead`] buffer and
 //! decodes each frame from a byte slice with [`SliceBitReader`], which
@@ -12,9 +12,14 @@
 //! The frame's CRC-16 is then computed over exactly the bytes the frame
 //! used. A frame that runs past the buffered bytes is decoded again once
 //! more are read, so the result never depends on where the buffer ends.
+//!
+//! The encoder writes each frame into a byte buffer with [`FrameWriter`],
+//! which collects up to 64 bits before storing them, and computes the
+//! frame's CRC-16 over the finished bytes.
 
-use bitstream_io::{BitCount, BitRead, BitReader, Endianness, Primitive};
-use bitstream_io::{SignedBitCount, SignedInteger, UnsignedInteger};
+use bitstream_io::UnsignedInteger;
+use bitstream_io::{BitCount, BitRead, BitReader, BitWrite, BitWriter, Endianness, Primitive};
+use bitstream_io::{CheckedSigned, CheckedUnsigned, SignedBitCount, SignedInteger};
 use std::io;
 
 /// Bytes read ahead from a stream but not yet decoded
@@ -433,6 +438,226 @@ impl io::Read for SliceBitReader<'_> {
     }
 }
 
+/// A big-endian bit writer that appends to a byte vector
+///
+/// It writes the same bits as bitstream-io's `BitWriter` and rejects the
+/// same values, through the same checks.
+pub(crate) struct FrameWriter<'v> {
+    out: &'v mut Vec<u8>,
+    // bits not yet stored, the latest in the least significant bit
+    acc: u64,
+    // how many, always below 64
+    bits: u32,
+}
+
+impl<'v> FrameWriter<'v> {
+    /// Appends to `out`
+    #[inline]
+    pub(crate) fn new(out: &'v mut Vec<u8>) -> Self {
+        Self {
+            out,
+            acc: 0,
+            bits: 0,
+        }
+    }
+
+    /// Stores the bits written so far, which must end on a byte boundary,
+    /// and gives the vector back
+    pub(crate) fn finish(self) -> &'v mut Vec<u8> {
+        debug_assert!(self.bits.is_multiple_of(8));
+        let bytes = (self.bits / 8) as usize;
+        let word = self.acc.to_be_bytes();
+        self.out.extend_from_slice(&word[8 - bytes..]);
+        self.out
+    }
+
+    /// The bits written so far
+    #[inline]
+    pub(crate) fn bit_len(&self) -> u64 {
+        self.out.len() as u64 * 8 + u64::from(self.bits)
+    }
+
+    /// Writes `folded` as a Rice code with parameter `k` (at most 30):
+    /// `folded >> k` zeros, a one, and the low `k` bits, as a unary count
+    /// and `k` more bits would
+    #[inline]
+    pub(crate) fn rice(&mut self, k: u32, folded: u32) {
+        debug_assert!(k <= 30);
+        let msb = folded >> k;
+        let code = (1u64 << k) | u64::from(folded & ((1 << k) - 1));
+        match u64::from(msb) + 1 + u64::from(k) {
+            n @ ..=64 => self.put(n as u32, code),
+            _ => {
+                let mut zeros = msb;
+                while zeros > 0 {
+                    let n = zeros.min(56);
+                    self.put(n, 0);
+                    zeros -= n;
+                }
+                self.put(k + 1, code);
+            }
+        }
+    }
+
+    /// Writes the low `n` bits of `value`, from 0 to 64; the rest must be 0
+    #[inline]
+    fn put(&mut self, n: u32, value: u64) {
+        debug_assert!(n <= 64 && (n == 64 || value >> n == 0));
+        if self.bits + n < 64 {
+            self.acc = self.acc.checked_shl(n).unwrap_or(0) | value;
+            self.bits += n;
+        } else {
+            // fill the accumulator to 64 bits and store them
+            let room = 64 - self.bits;
+            let rest = n - room;
+            let word = self.acc.checked_shl(room).unwrap_or(0) | (value >> rest);
+            self.out.extend_from_slice(&word.to_be_bytes());
+            self.acc = value & !u64::MAX.checked_shl(rest).unwrap_or(0);
+            self.bits = rest;
+        }
+    }
+}
+
+/// The low 64 bits of an unsigned value
+#[inline]
+fn unsigned_low_u64<U: UnsignedInteger>(value: U) -> u64 {
+    let be = value.to_be_bytes();
+    let bytes = be.as_ref();
+    let mut low = [0u8; 8];
+    match bytes.len() {
+        len @ 8.. => low.copy_from_slice(&bytes[len - 8..]),
+        len => low[8 - len..].copy_from_slice(bytes),
+    }
+    u64::from_be_bytes(low)
+}
+
+impl BitWrite for FrameWriter<'_> {
+    #[inline]
+    fn write_bit(&mut self, bit: bool) -> io::Result<()> {
+        self.put(1, u64::from(bit));
+        Ok(())
+    }
+
+    #[inline]
+    fn write_unsigned_counted<const BITS: u32, U>(
+        &mut self,
+        count: BitCount<BITS>,
+        value: U,
+    ) -> io::Result<()>
+    where
+        U: UnsignedInteger,
+    {
+        let (count, value) = CheckedUnsigned::new(count, value)?.into_count_value();
+        match u32::from(count) {
+            bits @ ..=64 => self.put(bits, unsigned_low_u64(value)),
+            bits => {
+                self.put(bits - 64, unsigned_low_u64(value >> 64));
+                self.put(64, unsigned_low_u64(value));
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn write_signed_counted<const MAX: u32, S>(
+        &mut self,
+        bits: impl TryInto<SignedBitCount<MAX>>,
+        value: S,
+    ) -> io::Result<()>
+    where
+        S: SignedInteger,
+    {
+        let bits: SignedBitCount<MAX> = bits.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "signed writes need at least 1 bit for sign",
+            )
+        })?;
+        let (bits, value) = CheckedSigned::new(bits, value)?.into_count_value();
+        // two's complement in `bits` bits: the sign, then the rest
+        let unsigned = u32::from(bits.unsigned_count());
+        let rest = match value.is_negative() {
+            true => value.as_negative(u32::from(bits.count())),
+            false => value.as_non_negative(),
+        };
+        self.put(1, u64::from(value.is_negative()));
+        match unsigned {
+            ..=64 => self.put(unsigned, unsigned_low_u64(rest)),
+            _ => {
+                self.put(unsigned - 64, unsigned_low_u64(rest >> 64));
+                self.put(64, unsigned_low_u64(rest));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_from<V>(&mut self, value: V) -> io::Result<()>
+    where
+        V: Primitive,
+    {
+        self.write_bytes(value.to_be_bytes().as_ref())
+    }
+
+    /// Orders the bytes by `F` and writes them in the big-endian bit stream,
+    /// which is what bitstream-io does when byte-aligned (frames do not use
+    /// this write)
+    fn write_as_from<F, V>(&mut self, value: V) -> io::Result<()>
+    where
+        F: Endianness,
+        V: Primitive,
+    {
+        let mut bytes = vec![];
+        BitWriter::<_, F>::new(&mut bytes).write_from(value)?;
+        self.write_bytes(&bytes)
+    }
+
+    fn write_bytes(&mut self, buf: &[u8]) -> io::Result<()> {
+        buf.iter().for_each(|byte| self.put(8, u64::from(*byte)));
+        Ok(())
+    }
+
+    #[inline]
+    fn write_unary<const STOP_BIT: u8>(&mut self, mut value: u32) -> io::Result<()> {
+        const {
+            assert!(matches!(STOP_BIT, 0 | 1), "stop bit must be 0 or 1");
+        }
+        let run = match STOP_BIT {
+            0 => u64::MAX,
+            _ => 0,
+        };
+        while value > 0 {
+            let n = value.min(56);
+            self.put(n, run >> (64 - n));
+            value -= n;
+        }
+        self.put(1, u64::from(STOP_BIT));
+        Ok(())
+    }
+
+    #[inline]
+    fn byte_aligned(&self) -> bool {
+        self.bits.is_multiple_of(8)
+    }
+
+    fn byte_align(&mut self) -> io::Result<()> {
+        let pad = (8 - self.bits % 8) % 8;
+        self.put(pad, 0);
+        Ok(())
+    }
+}
+
+/// Whole bytes, for writers that take a byte stream (frame headers)
+impl io::Write for FrameWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_bytes(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::SliceBitReader;
@@ -586,6 +811,98 @@ mod test {
                     "{context}: alignment"
                 );
             }
+        }
+    }
+
+    /// The same random operations on bitstream-io's writer and on ours:
+    /// the same bytes, and errors for the same values
+    #[test]
+    fn writes_like_bitstream_io() {
+        use super::FrameWriter;
+        use bitstream_io::{BitWrite, BitWriter, CheckedUnsigned};
+
+        let mut rng = Rng(0x00_B175_17E5);
+        for round in 0..4000 {
+            let mut theirs = BitWriter::endian(Vec::new(), BigEndian);
+            let mut out = vec![];
+            let mut ours = FrameWriter::new(&mut out);
+            for step in 0..60 {
+                let n = rng.below(70) as u32;
+                let v = rng.next();
+                let context = format!("round {round}, step {step}, n {n}, value {v:#x}");
+                macro_rules! same {
+                    ($w:ident => $e:expr) => {{
+                        let a = {
+                            let $w = &mut theirs;
+                            $e
+                        };
+                        let b = {
+                            let $w = &mut ours;
+                            $e
+                        };
+                        match (&a, &b) {
+                            (Ok(()), Ok(())) => {}
+                            (Err(x), Err(y)) => assert_eq!(x.kind(), y.kind(), "{context}"),
+                            _ => panic!("{context}: {a:?} against {b:?}"),
+                        }
+                    }};
+                }
+                let count64 = BitCount::<64>::try_from(n.min(64)).unwrap();
+                let count32 = BitCount::<32>::try_from(n.min(32)).unwrap();
+                let signed32 = BitCount::<32>::try_from(1 + n % 32)
+                    .unwrap()
+                    .signed_count()
+                    .unwrap();
+                match rng.below(13) {
+                    0 => same!(w => w.write_bit(v & 1 == 1)),
+                    1 => same!(w => w.write_unary::<1>((v % 200) as u32)),
+                    2 => same!(w => w.write_unary::<0>((v % 200) as u32)),
+                    // values that fit, and values that do not
+                    3 => same!(w => w.write_unsigned_counted::<64, u64>(count64, v >> (v % 64))),
+                    4 => {
+                        same!(w => w.write_unsigned_counted::<32, u32>(count32, (v >> (v % 64)) as u32))
+                    }
+                    5 => same!(w => w.write_unsigned_counted::<64, u8>(count64, v as u8)),
+                    6 => {
+                        same!(w => w.write_signed_counted::<32, i32>(signed32, (v as i32) >> (v % 32)))
+                    }
+                    7 => {
+                        same!(w => w.write_signed_counted::<32, i64>(signed32, (v as i64) >> (v % 64)))
+                    }
+                    8 => same!(w => w.write_checked(
+                        CheckedUnsigned::<32, u32>::new(count32, (v as u32) & ((1u64 << u32::from(count32)) - 1) as u32).unwrap()
+                    )),
+                    9 => same!(w => w.write_from(v as u32)),
+                    // a Rice code: a unary count and then `k` bits
+                    11 => {
+                        // unary runs of up to 300 bits, past the 64-bit fast path
+                        let k = (v % 31) as u32;
+                        let msb = ((v >> 8) % 300) as u32;
+                        let folded = (msb.min(u32::MAX >> k) << k)
+                            | ((v >> 20) as u32 & ((1u64 << k) - 1) as u32);
+                        theirs.write_unary::<1>(folded >> k).unwrap();
+                        theirs
+                            .write_unsigned_counted::<32, u32>(
+                                BitCount::try_from(k).unwrap(),
+                                folded & ((1u64 << k) - 1) as u32,
+                            )
+                            .unwrap();
+                        ours.rice(k, folded);
+                    }
+                    // bitstream-io mixes bit orders for this write when it is not
+                    // byte-aligned; frames never use it, so compare it aligned
+                    10 => {
+                        theirs.byte_align().unwrap();
+                        ours.byte_align().unwrap();
+                        same!(w => w.write_as_from::<LittleEndian, u16>(v as u16))
+                    }
+                    _ => same!(w => w.byte_align()),
+                }
+                assert_eq!(theirs.byte_aligned(), ours.byte_aligned(), "{context}");
+            }
+            theirs.byte_align().unwrap();
+            ours.byte_align().unwrap();
+            assert_eq!(*ours.finish(), theirs.into_writer(), "round {round}");
         }
     }
 
