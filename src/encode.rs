@@ -21,10 +21,14 @@ use crate::metadata::{
     Application, BlockList, BlockSize, Cuesheet, Picture, PortableMetadataBlock, SeekPoint,
     Streaminfo, VorbisComment, write_blocks,
 };
-use crate::stream::{ChannelAssignment, FrameNumber, Independent, SampleRate};
+use crate::stream::{
+    ChannelAssignment, FrameNumber, Independent, ResidualPartitionHeader, SampleRate,
+};
 use crate::{Counter, Error};
 use arrayvec::ArrayVec;
-use bitstream_io::{BigEndian, BitRecorder, BitWrite, BitWriter, BitsWritten, SignedBitCount};
+use bitstream_io::{
+    BigEndian, BitCount, BitRecorder, BitWrite, BitWriter, BitsWritten, SignedBitCount, ToBitStream,
+};
 use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZero;
@@ -1829,12 +1833,30 @@ struct CorrelationCache {
 #[derive(Default)]
 struct ChannelCache {
     fixed: FixedCache,
-    fixed_output: BitRecorder<u32, BigEndian>,
     lpc: LpcCache,
-    lpc_output: BitRecorder<u32, BigEndian>,
-    constant_output: BitRecorder<u32, BigEndian>,
-    verbatim_output: BitRecorder<u32, BigEndian>,
     wasted: Vec<i32>,
+    // the chosen subframe, written
+    output: BitRecorder<u32, BigEndian>,
+}
+
+/// The parts of a channel cache a subframe plan borrows
+struct Planning<'c> {
+    fixed: &'c mut FixedCache,
+    lpc: &'c mut LpcCache,
+    wasted: &'c mut Vec<i32>,
+}
+
+impl ChannelCache {
+    /// What planning borrows, and the output to write the plan into
+    fn split(&mut self) -> (Planning<'_>, &mut BitRecorder<u32, BigEndian>) {
+        let ChannelCache {
+            fixed,
+            lpc,
+            wasted,
+            output,
+        } = self;
+        (Planning { fixed, lpc, wasted }, output)
+    }
 }
 
 #[derive(Default)]
@@ -2846,45 +2868,164 @@ fn correlate_channels_exhaustive<'c>(
     }
 }
 
-fn encode_subframe<'c>(
+/// A channel's subframe, chosen but not yet written, and its exact size
+struct SubframePlan<'c> {
+    kind: SubframeKind<'c>,
+    bits: u32,
+}
+
+enum SubframeKind<'c> {
+    Constant {
+        sample: i32,
+        bits_per_sample: SignedBitCount<32>,
+    },
+    Verbatim {
+        samples: &'c [i32],
+        bits_per_sample: SignedBitCount<32>,
+        wasted_bps: u32,
+    },
+    Fixed {
+        fixed: (u8, &'c [i32], &'c [i32]),
+        residuals: CodingMethod<'c>,
+        bits_per_sample: SignedBitCount<32>,
+        wasted_bps: u32,
+    },
+    Lpc {
+        lpc: LpcSubframeParameters<'c, 'c>,
+        residuals: CodingMethod<'c>,
+        bits_per_sample: SignedBitCount<32>,
+        wasted_bps: u32,
+    },
+}
+
+impl SubframePlan<'_> {
+    fn write<W: BitWrite>(&self, writer: &mut W) -> Result<(), Error> {
+        match &self.kind {
+            SubframeKind::Constant {
+                sample,
+                bits_per_sample,
+            } => encode_constant_subframe(writer, *sample, *bits_per_sample, 0),
+            SubframeKind::Verbatim {
+                samples,
+                bits_per_sample,
+                wasted_bps,
+            } => encode_verbatim_subframe(writer, samples, *bits_per_sample, *wasted_bps),
+            SubframeKind::Fixed {
+                fixed,
+                residuals,
+                bits_per_sample,
+                wasted_bps,
+            } => {
+                write_fixed_head(writer, *fixed, *bits_per_sample, *wasted_bps)?;
+                residuals.write(writer)
+            }
+            SubframeKind::Lpc {
+                lpc,
+                residuals,
+                bits_per_sample,
+                wasted_bps,
+            } => {
+                write_lpc_head(writer, lpc, *bits_per_sample, *wasted_bps)?;
+                residuals.write(writer)
+            }
+        }
+    }
+
+    /// Writes the subframe into `output`, replacing what it held
+    fn record<'o>(
+        &self,
+        output: &'o mut BitRecorder<u32, BigEndian>,
+    ) -> Result<&'o BitRecorder<u32, BigEndian>, Error> {
+        output.clear();
+        self.write(output)?;
+        debug_assert_eq!(
+            output.written(),
+            self.bits,
+            "planned and written sizes differ"
+        );
+        Ok(output)
+    }
+}
+
+/// The bits `write` writes, failing as a 32-bit bit counter would
+fn count_bits(
+    write: impl FnOnce(&mut BitsWritten<u32>) -> Result<(), Error>,
+) -> Result<u32, Error> {
+    let mut bits = BitsWritten::<u32>::new();
+    write(&mut bits)?;
+    Ok(bits.written())
+}
+
+/// A subframe head's bits and its residuals' bits, failing as a 32-bit bit
+/// counter would
+fn with_residual_bits(head: u32, residuals: &CodingMethod<'_>) -> Result<u32, Error> {
+    residuals
+        .bits()
+        .and_then(|bits| u32::try_from(u64::from(head) + bits).ok())
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "excessive value for bits written",
+            ))
+        })
+}
+
+/// Chooses a channel's subframe: CONSTANT, VERBATIM, FIXED or LPC,
+/// whichever is smallest, without writing it
+fn plan_subframe<'c>(
     options: &EncoderOptions,
-    ChannelCache {
+    Planning {
         fixed: fixed_cache,
-        fixed_output,
         lpc: lpc_cache,
-        lpc_output,
-        constant_output,
-        verbatim_output,
         wasted,
-    }: &'c mut ChannelCache,
+    }: Planning<'c>,
     CorrelatedChannel {
         samples: channel,
         bits_per_sample,
         all_0,
-    }: CorrelatedChannel,
-) -> Result<&'c BitRecorder<u32, BigEndian>, Error> {
+    }: CorrelatedChannel<'c>,
+) -> Result<SubframePlan<'c>, Error> {
     const WASTED_MAX: NonZero<u32> = NonZero::new(32).unwrap();
 
     debug_assert!(!channel.is_empty());
 
+    let constant = |sample: i32| -> Result<SubframePlan<'c>, Error> {
+        Ok(SubframePlan {
+            bits: count_bits(|w| encode_constant_subframe(w, sample, bits_per_sample, 0))?,
+            kind: SubframeKind::Constant {
+                sample,
+                bits_per_sample,
+            },
+        })
+    };
+    let verbatim = |samples: &'c [i32],
+                    bits_per_sample: SignedBitCount<32>,
+                    wasted_bps: u32|
+     -> Result<SubframePlan<'c>, Error> {
+        Ok(SubframePlan {
+            bits: count_bits(|w| {
+                encode_verbatim_subframe(w, samples, bits_per_sample, wasted_bps)
+            })?,
+            kind: SubframeKind::Verbatim {
+                samples,
+                bits_per_sample,
+                wasted_bps,
+            },
+        })
+    };
+
     if all_0 {
         // all samples are 0
-        constant_output.clear();
-        encode_constant_subframe(constant_output, channel[0], bits_per_sample, 0)?;
-        return Ok(constant_output);
+        return constant(channel[0]);
     }
 
     // determine any wasted bits
-    let (channel, bits_per_sample, wasted_bps) =
+    let (channel, bits_per_sample, wasted_bps): (&'c [i32], _, _) =
         match channel.iter().try_fold(WASTED_MAX, |acc, sample| {
             NonZero::new(sample.trailing_zeros()).map(|sample| sample.min(acc))
         }) {
             None => (channel, bits_per_sample, 0),
-            Some(WASTED_MAX) => {
-                constant_output.clear();
-                encode_constant_subframe(constant_output, channel[0], bits_per_sample, 0)?;
-                return Ok(constant_output);
-            }
+            Some(WASTED_MAX) => return constant(channel[0]),
             Some(wasted_bps) => {
                 let wasted_bps = wasted_bps.get();
                 wasted.clear();
@@ -2897,99 +3038,75 @@ fn encode_subframe<'c>(
             }
         };
 
-    fixed_output.clear();
+    let fixed = move |fixed_cache: &'c mut FixedCache| -> Result<SubframePlan<'c>, Error> {
+        let fixed = fixed_parameters(fixed_cache, channel);
+        let residuals = plan_residuals(options, fixed.0.into(), fixed.2);
+        let head = count_bits(|w| write_fixed_head(w, fixed, bits_per_sample, wasted_bps))?;
+        Ok(SubframePlan {
+            bits: with_residual_bits(head, &residuals)?,
+            kind: SubframeKind::Fixed {
+                fixed,
+                residuals,
+                bits_per_sample,
+                wasted_bps,
+            },
+        })
+    };
 
     let best = match options.max_lpc_order {
         Some(max_lpc_order) => {
-            lpc_output.clear();
+            let lpc = move |lpc_cache: &'c mut LpcCache| -> Result<SubframePlan<'c>, Error> {
+                let lpc = LpcSubframeParameters::best(
+                    options,
+                    bits_per_sample,
+                    max_lpc_order,
+                    lpc_cache,
+                    channel,
+                )?;
+                let residuals =
+                    plan_residuals(options, lpc.parameters.order.get().into(), lpc.residuals);
+                let head = count_bits(|w| write_lpc_head(w, &lpc, bits_per_sample, wasted_bps))?;
+                Ok(SubframePlan {
+                    bits: with_residual_bits(head, &residuals)?,
+                    kind: SubframeKind::Lpc {
+                        lpc,
+                        residuals,
+                        bits_per_sample,
+                        wasted_bps,
+                    },
+                })
+            };
 
-            // both candidates are only counted, and the smaller one is written
-            // (FIXED when they are the same size)
-            match join(
-                || {
-                    let fixed = fixed_parameters(fixed_cache, channel);
-                    let mut bits = BitsWritten::<u32>::new();
-                    write_fixed_subframe(options, &mut bits, fixed, bits_per_sample, wasted_bps)
-                        .map(|()| (fixed, bits.written()))
-                },
-                || {
-                    LpcSubframeParameters::best(
-                        options,
-                        bits_per_sample,
-                        max_lpc_order,
-                        lpc_cache,
-                        channel,
-                    )
-                    .and_then(|lpc| {
-                        let mut bits = BitsWritten::<u32>::new();
-                        write_lpc_subframe(options, &mut bits, &lpc, bits_per_sample, wasted_bps)
-                            .map(|()| (lpc, bits.written()))
-                    })
-                },
-            ) {
-                (Ok((_, fixed_bits)), Ok((lpc, lpc_bits))) if lpc_bits < fixed_bits => {
-                    write_lpc_subframe(options, lpc_output, &lpc, bits_per_sample, wasted_bps)?;
-                    lpc_output
-                }
-                (Ok((fixed, _)), _) => {
-                    write_fixed_subframe(
-                        options,
-                        fixed_output,
-                        fixed,
-                        bits_per_sample,
-                        wasted_bps,
-                    )?;
-                    fixed_output
-                }
-                (Err(_), Ok((lpc, _))) => {
-                    write_lpc_subframe(options, lpc_output, &lpc, bits_per_sample, wasted_bps)?;
-                    lpc_output
-                }
-                (Err(_), Err(_)) => {
-                    verbatim_output.clear();
-                    encode_verbatim_subframe(
-                        verbatim_output,
-                        channel,
-                        bits_per_sample,
-                        wasted_bps,
-                    )?;
-                    return Ok(verbatim_output);
-                }
+            // the smaller candidate, FIXED when they are the same size
+            match join(|| fixed(fixed_cache), || lpc(lpc_cache)) {
+                (Ok(fixed), Ok(lpc)) if lpc.bits < fixed.bits => lpc,
+                (Ok(fixed), _) => fixed,
+                (Err(_), Ok(lpc)) => lpc,
+                (Err(_), Err(_)) => return verbatim(channel, bits_per_sample, wasted_bps),
             }
         }
-        _ => {
-            match encode_fixed_subframe(
-                options,
-                fixed_cache,
-                fixed_output,
-                channel,
-                bits_per_sample,
-                wasted_bps,
-            ) {
-                Ok(()) => fixed_output,
-                Err(_) => {
-                    verbatim_output.clear();
-                    encode_verbatim_subframe(
-                        verbatim_output,
-                        channel,
-                        bits_per_sample,
-                        wasted_bps,
-                    )?;
-                    return Ok(verbatim_output);
-                }
-            }
-        }
+        _ => match fixed(fixed_cache) {
+            Ok(fixed) => fixed,
+            Err(_) => return verbatim(channel, bits_per_sample, wasted_bps),
+        },
     };
 
     let verbatim_len = channel.len() as u32 * u32::from(bits_per_sample);
 
-    if best.written() < verbatim_len {
+    if best.bits < verbatim_len {
         Ok(best)
     } else {
-        verbatim_output.clear();
-        encode_verbatim_subframe(verbatim_output, channel, bits_per_sample, wasted_bps)?;
-        Ok(verbatim_output)
+        verbatim(channel, bits_per_sample, wasted_bps)
     }
+}
+
+fn encode_subframe<'c>(
+    options: &EncoderOptions,
+    cache: &'c mut ChannelCache,
+    channel: CorrelatedChannel<'_>,
+) -> Result<&'c BitRecorder<u32, BigEndian>, Error> {
+    let (planning, output) = cache.split();
+    plan_subframe(options, planning, channel)?.record(output)
 }
 
 fn encode_constant_subframe<W: BitWrite>(
@@ -3028,18 +3145,6 @@ fn encode_verbatim_subframe<W: BitWrite>(
         .try_for_each(|i| writer.write_signed_counted(bits_per_sample, *i))?;
 
     Ok(())
-}
-
-fn encode_fixed_subframe<W: BitWrite>(
-    options: &EncoderOptions,
-    cache: &mut FixedCache,
-    writer: &mut W,
-    channel: &[i32],
-    bits_per_sample: SignedBitCount<32>,
-    wasted_bps: u32,
-) -> Result<(), Error> {
-    let fixed = fixed_parameters(cache, channel);
-    write_fixed_subframe(options, writer, fixed, bits_per_sample, wasted_bps)
 }
 
 /// The FIXED order for `channel` with the smallest residuals:
@@ -3154,10 +3259,10 @@ fn fixed_parameters_match_checking_each_difference() {
     }
 }
 
-fn write_fixed_subframe<W: BitWrite>(
-    options: &EncoderOptions,
+/// Writes a FIXED subframe's header and warm-up samples
+fn write_fixed_head<W: BitWrite>(
     writer: &mut W,
-    (order, warm_up, residuals): (u8, &[i32], &[i32]),
+    (order, warm_up, _): (u8, &[i32], &[i32]),
     bits_per_sample: SignedBitCount<32>,
     wasted_bps: u32,
 ) -> Result<(), Error> {
@@ -3172,15 +3277,14 @@ fn write_fixed_subframe<W: BitWrite>(
         .iter()
         .try_for_each(|sample: &i32| writer.write_signed_counted(bits_per_sample, *sample))?;
 
-    write_residuals(options, writer, order.into(), residuals)
+    Ok(())
 }
 
-fn write_lpc_subframe<W: BitWrite>(
-    options: &EncoderOptions,
+/// Writes an LPC subframe's header, warm-up samples and coefficients
+fn write_lpc_head<W: BitWrite>(
     writer: &mut W,
     LpcSubframeParameters {
         warm_up,
-        residuals,
         parameters:
             LpcParameters {
                 order,
@@ -3188,6 +3292,7 @@ fn write_lpc_subframe<W: BitWrite>(
                 shift,
                 coefficients,
             },
+        ..
     }: &LpcSubframeParameters,
     bits_per_sample: SignedBitCount<32>,
     wasted_bps: u32,
@@ -3216,7 +3321,7 @@ fn write_lpc_subframe<W: BitWrite>(
         writer.write_signed_counted(*precision, *coeff)?;
     }
 
-    write_residuals(options, writer, order.get().into(), residuals)
+    Ok(())
 }
 
 struct LpcSubframeParameters<'w, 'r> {
@@ -3946,228 +4051,325 @@ fn test_compute_best_order() {
     assert_float_approx!(bits.next().unwrap(), 3935.492805);
 }
 
-fn write_residuals<W: BitWrite>(
-    options: &EncoderOptions,
-    writer: &mut W,
-    predictor_order: usize,
-    residuals: &[i32],
-) -> Result<(), Error> {
-    use crate::stream::ResidualPartitionHeader;
-    use bitstream_io::{BitCount, ToBitStream};
+#[derive(Debug)]
+struct Partition<'r, const RICE_MAX: u32> {
+    header: ResidualPartitionHeader<RICE_MAX>,
+    residuals: &'r [i32],
+}
 
-    #[derive(Debug)]
-    struct Partition<'r, const RICE_MAX: u32> {
-        header: ResidualPartitionHeader<RICE_MAX>,
-        residuals: &'r [i32],
-    }
-
-    impl<'r, const RICE_MAX: u32> Partition<'r, RICE_MAX> {
-        /// `partition_sum` is the sum of the residuals' magnitudes
-        fn new(partition: &'r [i32], partition_sum: u64, estimated_bits: &mut u32) -> Option<Self> {
-            let partition_samples = partition.len() as u16;
-            if partition_samples == 0 {
-                return None;
-            }
-
-            if partition_sum > 0 {
-                let rice = if partition_sum > partition_samples.into() {
-                    let bits_needed = ((partition_sum as f64) / f64::from(partition_samples))
-                        .log2()
-                        .ceil() as u32;
-
-                    match BitCount::try_from(bits_needed).ok().filter(|rice| {
-                        u32::from(*rice) < u32::from(BitCount::<RICE_MAX>::new::<RICE_MAX>())
-                    }) {
-                        Some(rice) => rice,
-                        None => {
-                            let escape_size = (partition_sum.ilog2() + 2).try_into().ok()?;
-
-                            *estimated_bits +=
-                                u32::from(escape_size) * u32::from(partition_samples);
-
-                            return Some(Self {
-                                header: ResidualPartitionHeader::Escaped { escape_size },
-                                residuals: partition,
-                            });
-                        }
-                    }
-                } else {
-                    BitCount::new::<0>()
-                };
-
-                let partition_size: u32 = 4u32
-                    + ((1 + u32::from(rice)) * u32::from(partition_samples))
-                    + if u32::from(rice) > 0 {
-                        u32::try_from(partition_sum >> (u32::from(rice) - 1)).ok()?
-                    } else {
-                        u32::try_from(partition_sum << 1).ok()?
-                    }
-                    - (u32::from(partition_samples) / 2);
-
-                *estimated_bits += partition_size;
-
-                Some(Partition {
-                    header: ResidualPartitionHeader::Standard { rice },
-                    residuals: partition,
-                })
-            } else {
-                // all partition residuals are 0, so use a constant
-                Some(Partition {
-                    header: ResidualPartitionHeader::Constant,
-                    residuals: partition,
-                })
-            }
+impl<'r, const RICE_MAX: u32> Partition<'r, RICE_MAX> {
+    /// `partition_sum` is the sum of the residuals' magnitudes
+    fn new(partition: &'r [i32], partition_sum: u64, estimated_bits: &mut u32) -> Option<Self> {
+        let partition_samples = partition.len() as u16;
+        if partition_samples == 0 {
+            return None;
         }
-    }
 
-    impl<const RICE_MAX: u32> ToBitStream for Partition<'_, RICE_MAX> {
-        type Error = std::io::Error;
+        if partition_sum > 0 {
+            let rice = if partition_sum > partition_samples.into() {
+                let bits_needed = ((partition_sum as f64) / f64::from(partition_samples))
+                    .log2()
+                    .ceil() as u32;
 
-        #[inline]
-        fn to_writer<W: BitWrite + ?Sized>(&self, w: &mut W) -> Result<(), Self::Error> {
-            w.build(&self.header)?;
-            match self.header {
-                ResidualPartitionHeader::Standard { rice } => {
-                    let mask = rice.mask_lsb();
+                match BitCount::try_from(bits_needed).ok().filter(|rice| {
+                    u32::from(*rice) < u32::from(BitCount::<RICE_MAX>::new::<RICE_MAX>())
+                }) {
+                    Some(rice) => rice,
+                    None => {
+                        let escape_size = (partition_sum.ilog2() + 2).try_into().ok()?;
 
-                    self.residuals.iter().try_for_each(|s| {
-                        let (msb, lsb) = mask(if s.is_negative() {
-                            ((s.unsigned_abs() - 1) << 1) + 1
-                        } else {
-                            (*s as u32) << 1
+                        *estimated_bits += u32::from(escape_size) * u32::from(partition_samples);
+
+                        return Some(Self {
+                            header: ResidualPartitionHeader::Escaped { escape_size },
+                            residuals: partition,
                         });
-                        w.write_unary::<1>(msb)?;
-                        w.write_checked(lsb)
-                    })?;
+                    }
                 }
-                ResidualPartitionHeader::Escaped { escape_size } => {
-                    self.residuals
-                        .iter()
-                        .try_for_each(|s| w.write_signed_counted(escape_size, *s))?;
+            } else {
+                BitCount::new::<0>()
+            };
+
+            let partition_size: u32 = 4u32
+                + ((1 + u32::from(rice)) * u32::from(partition_samples))
+                + if u32::from(rice) > 0 {
+                    u32::try_from(partition_sum >> (u32::from(rice) - 1)).ok()?
+                } else {
+                    u32::try_from(partition_sum << 1).ok()?
                 }
-                ResidualPartitionHeader::Constant => { /* nothing left to do */ }
-            }
-            Ok(())
+                - (u32::from(partition_samples) / 2);
+
+            *estimated_bits += partition_size;
+
+            Some(Partition {
+                header: ResidualPartitionHeader::Standard { rice },
+                residuals: partition,
+            })
+        } else {
+            // all partition residuals are 0, so use a constant
+            Some(Partition {
+                header: ResidualPartitionHeader::Constant,
+                residuals: partition,
+            })
         }
     }
+}
 
-    // a partition order of up to 15 allows 32768 partitions,
-    // more than fit on the stack
-    fn best_partitions<'r, const RICE_MAX: u32>(
-        options: &EncoderOptions,
-        block_size: usize,
-        residuals: &'r [i32],
-    ) -> Vec<Partition<'r, RICE_MAX>> {
-        let max_order = block_size.trailing_zeros().min(options.max_partition_order);
+impl<const RICE_MAX: u32> ToBitStream for Partition<'_, RICE_MAX> {
+    type Error = std::io::Error;
 
-        // the residuals' magnitudes summed per partition of the finest order,
-        // from the end as `rchunks` splits them, so that each coarser order
-        // adds up runs of these instead of reading every residual again
-        let finest = block_size >> max_order;
-        let sums: Vec<u64> = residuals
-            .rchunks(finest)
-            .map(|partition| partition.iter().map(|i| u64::from(i.unsigned_abs())).sum())
-            .collect();
+    #[inline]
+    fn to_writer<W: BitWrite + ?Sized>(&self, w: &mut W) -> Result<(), Self::Error> {
+        w.build(&self.header)?;
+        match self.header {
+            ResidualPartitionHeader::Standard { rice } => {
+                let mask = rice.mask_lsb();
 
-        (0..=max_order)
-            .map(|partition_order| 1 << partition_order)
-            .take_while(|partition_count: &usize| partition_count.is_power_of_two())
-            .filter_map(|partition_count| {
-                let mut estimated_bits = 0;
-
-                // a predictor order of at least the partition size leaves fewer
-                // chunks than partitions, which this partition order cannot describe
-                if block_size / partition_count <= block_size - residuals.len() {
-                    return None;
-                }
-
-                let partition_size = block_size / partition_count;
-                let partitions = residuals
-                    .rchunks(partition_size)
-                    .zip(sums.chunks(partition_size / finest))
-                    .rev()
-                    .map(|(partition, sums)| {
-                        Partition::new(partition, sums.iter().sum(), &mut estimated_bits)
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .filter(|p| !p.is_empty() && p.len().is_power_of_two())?;
-
-                Some((partitions, estimated_bits))
-            })
-            .min_by_key(|(_, estimated_bits)| *estimated_bits)
-            .map(|(partitions, _)| partitions)
-            .unwrap_or_else(|| {
-                std::iter::once(Partition {
-                    header: ResidualPartitionHeader::Escaped {
-                        escape_size: SignedBitCount::new::<0b11111>(),
-                    },
-                    residuals,
-                })
-                .collect()
-            })
-    }
-
-    fn write_partitions<const RICE_MAX: u32, W: BitWrite>(
-        writer: &mut W,
-        partitions: Vec<Partition<'_, RICE_MAX>>,
-    ) -> Result<(), Error> {
-        writer.write::<4, u32>(partitions.len().ilog2())?; // partition order
-        for partition in partitions {
-            writer.build(&partition)?;
+                self.residuals.iter().try_for_each(|s| {
+                    let (msb, lsb) = mask(if s.is_negative() {
+                        ((s.unsigned_abs() - 1) << 1) + 1
+                    } else {
+                        (*s as u32) << 1
+                    });
+                    w.write_unary::<1>(msb)?;
+                    w.write_checked(lsb)
+                })?;
+            }
+            ResidualPartitionHeader::Escaped { escape_size } => {
+                self.residuals
+                    .iter()
+                    .try_for_each(|s| w.write_signed_counted(escape_size, *s))?;
+            }
+            ResidualPartitionHeader::Constant => { /* nothing left to do */ }
         }
         Ok(())
     }
+}
 
-    #[inline]
-    fn try_shrink_header<const RICE_MAX: u32, const RICE_NEW_MAX: u32>(
-        header: ResidualPartitionHeader<RICE_MAX>,
-    ) -> Option<ResidualPartitionHeader<RICE_NEW_MAX>> {
-        Some(match header {
-            ResidualPartitionHeader::Standard { rice } => ResidualPartitionHeader::Standard {
-                rice: rice.try_map(|r| (r < RICE_NEW_MAX).then_some(r))?,
-            },
-            ResidualPartitionHeader::Escaped { escape_size } => {
-                ResidualPartitionHeader::Escaped { escape_size }
+// a partition order of up to 15 allows 32768 partitions,
+// more than fit on the stack
+fn best_partitions<'r, const RICE_MAX: u32>(
+    options: &EncoderOptions,
+    block_size: usize,
+    residuals: &'r [i32],
+) -> Vec<Partition<'r, RICE_MAX>> {
+    let max_order = block_size.trailing_zeros().min(options.max_partition_order);
+
+    // the residuals' magnitudes summed per partition of the finest order,
+    // from the end as `rchunks` splits them, so that each coarser order
+    // adds up runs of these instead of reading every residual again
+    let finest = block_size >> max_order;
+    let sums: Vec<u64> = residuals
+        .rchunks(finest)
+        .map(|partition| partition.iter().map(|i| u64::from(i.unsigned_abs())).sum())
+        .collect();
+
+    (0..=max_order)
+        .map(|partition_order| 1 << partition_order)
+        .take_while(|partition_count: &usize| partition_count.is_power_of_two())
+        .filter_map(|partition_count| {
+            let mut estimated_bits = 0;
+
+            // a predictor order of at least the partition size leaves fewer
+            // chunks than partitions, which this partition order cannot describe
+            if block_size / partition_count <= block_size - residuals.len() {
+                return None;
             }
-            ResidualPartitionHeader::Constant => ResidualPartitionHeader::Constant,
+
+            let partition_size = block_size / partition_count;
+            let partitions = residuals
+                .rchunks(partition_size)
+                .zip(sums.chunks(partition_size / finest))
+                .rev()
+                .map(|(partition, sums)| {
+                    Partition::new(partition, sums.iter().sum(), &mut estimated_bits)
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|p| !p.is_empty() && p.len().is_power_of_two())?;
+
+            Some((partitions, estimated_bits))
         })
-    }
-
-    enum CodingMethod<'p> {
-        Rice(Vec<Partition<'p, 0b1111>>),
-        Rice2(Vec<Partition<'p, 0b11111>>),
-    }
-
-    fn try_reduce_rice(partitions: Vec<Partition<'_, 0b11111>>) -> CodingMethod<'_> {
-        match partitions
-            .iter()
-            .map(|Partition { header, residuals }| {
-                try_shrink_header(*header).map(|header| Partition { header, residuals })
+        .min_by_key(|(_, estimated_bits)| *estimated_bits)
+        .map(|(partitions, _)| partitions)
+        .unwrap_or_else(|| {
+            std::iter::once(Partition {
+                header: ResidualPartitionHeader::Escaped {
+                    escape_size: SignedBitCount::new::<0b11111>(),
+                },
+                residuals,
             })
             .collect()
-        {
-            Some(partitions) => CodingMethod::Rice(partitions),
-            None => CodingMethod::Rice2(partitions),
+        })
+}
+
+fn write_partitions<const RICE_MAX: u32, W: BitWrite>(
+    writer: &mut W,
+    partitions: &[Partition<'_, RICE_MAX>],
+) -> Result<(), Error> {
+    writer.write::<4, u32>(partitions.len().ilog2())?; // partition order
+    for partition in partitions {
+        writer.build(partition)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn try_shrink_header<const RICE_MAX: u32, const RICE_NEW_MAX: u32>(
+    header: ResidualPartitionHeader<RICE_MAX>,
+) -> Option<ResidualPartitionHeader<RICE_NEW_MAX>> {
+    Some(match header {
+        ResidualPartitionHeader::Standard { rice } => ResidualPartitionHeader::Standard {
+            rice: rice.try_map(|r| (r < RICE_NEW_MAX).then_some(r))?,
+        },
+        ResidualPartitionHeader::Escaped { escape_size } => {
+            ResidualPartitionHeader::Escaped { escape_size }
         }
+        ResidualPartitionHeader::Constant => ResidualPartitionHeader::Constant,
+    })
+}
+
+enum CodingMethod<'p> {
+    Rice(Vec<Partition<'p, 0b1111>>),
+    Rice2(Vec<Partition<'p, 0b11111>>),
+}
+
+fn try_reduce_rice(partitions: Vec<Partition<'_, 0b11111>>) -> CodingMethod<'_> {
+    match partitions
+        .iter()
+        .map(|Partition { header, residuals }| {
+            try_shrink_header(*header).map(|header| Partition { header, residuals })
+        })
+        .collect()
+    {
+        Some(partitions) => CodingMethod::Rice(partitions),
+        None => CodingMethod::Rice2(partitions),
+    }
+}
+
+/// How a subframe's residuals are coded, chosen but not yet written
+impl CodingMethod<'_> {
+    /// The number of bits `write` produces,
+    /// or `None` where `write` would fail
+    fn bits(&self) -> Option<u64> {
+        Some(
+            2 + match self {
+                Self::Rice(partitions) => partitions_bits(partitions)?,
+                Self::Rice2(partitions) => partitions_bits(partitions)?,
+            },
+        )
     }
 
-    let block_size = predictor_order + residuals.len();
-
-    if options.use_rice2 {
-        match try_reduce_rice(best_partitions(options, block_size, residuals)) {
-            CodingMethod::Rice(partitions) => {
+    fn write<W: BitWrite>(&self, writer: &mut W) -> Result<(), Error> {
+        match self {
+            Self::Rice(partitions) => {
                 writer.write::<2, u8>(0)?; // coding method 0
                 write_partitions(writer, partitions)
             }
-            CodingMethod::Rice2(partitions) => {
+            Self::Rice2(partitions) => {
                 writer.write::<2, u8>(1)?; // coding method 1
                 write_partitions(writer, partitions)
             }
         }
+    }
+}
+
+/// The partitions' bits as `write_partitions` writes them: the partition order,
+/// then each partition's header and residuals; `None` where writing would fail
+/// (an escaped residual that does not fit in the escape size)
+fn partitions_bits<const RICE_MAX: u32>(partitions: &[Partition<'_, RICE_MAX>]) -> Option<u64> {
+    // a Rice parameter or the escape code takes the bits of RICE_MAX
+    let parameter = u64::from((RICE_MAX + 1).ilog2());
+    partitions
+        .iter()
+        .map(|Partition { header, residuals }| match header {
+            ResidualPartitionHeader::Standard { rice } => {
+                let rice = u32::from(*rice);
+                Some(
+                    parameter
+                        + residuals
+                            .iter()
+                            .map(|s| {
+                                let folded = if s.is_negative() {
+                                    ((s.unsigned_abs() - 1) << 1) + 1
+                                } else {
+                                    (*s as u32) << 1
+                                };
+                                u64::from(folded >> rice) + 1 + u64::from(rice)
+                            })
+                            .sum::<u64>(),
+                )
+            }
+            ResidualPartitionHeader::Escaped { escape_size } => {
+                let bits = u32::from(escape_size.count());
+                let (min, max) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
+                residuals
+                    .iter()
+                    .all(|s| (min..=max).contains(&i64::from(*s)))
+                    .then(|| parameter + 5 + residuals.len() as u64 * u64::from(bits))
+            }
+            ResidualPartitionHeader::Constant => Some(parameter + 5),
+        })
+        .try_fold(4, |total, bits| Some(total + bits?))
+}
+
+#[test]
+fn residual_bits_match_what_is_written() {
+    // random residuals from small to the edges of i32, every partition order,
+    // with and without RICE2: `bits` must be what `write` writes, and `None`
+    // exactly where writing fails
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut failures = 0;
+    for round in 0..3000 {
+        let options = EncoderOptions {
+            max_partition_order: (next() % 16) as u32,
+            mid_side: false,
+            seektable_interval: None,
+            max_lpc_order: None,
+            window: Window::default(),
+            exhaustive_channel_correlation: false,
+            use_rice2: next() % 2 == 0,
+        };
+        let block = [16usize, 192, 1152, 4096, 4608][round % 5];
+        let order = (next() % 9) as usize;
+        let bits = [1u32, 4, 12, 20, 28, 31, 32][(next() % 7) as usize];
+        let residuals: Vec<i32> = (0..block - order)
+            .map(|_| match next() % 10 {
+                0 => i32::MIN,
+                1 => i32::MAX,
+                2 => 0,
+                _ => (next() as i32) >> (32 - bits),
+            })
+            .collect();
+        let plan = plan_residuals(&options, order, &residuals);
+        let mut written = BitsWritten::<u32>::new();
+        match (plan.bits(), plan.write(&mut written)) {
+            (Some(bits), Ok(())) => assert_eq!(bits, u64::from(written.written()), "round {round}"),
+            (None, Err(_)) => failures += 1,
+            (bits, result) => panic!("round {round}: planned {bits:?}, written {result:?}"),
+        }
+    }
+    // some rounds do fail to write, so that case is checked too
+    assert!(failures > 0);
+}
+
+/// Chooses how to code a subframe's residuals
+fn plan_residuals<'r>(
+    options: &EncoderOptions,
+    predictor_order: usize,
+    residuals: &'r [i32],
+) -> CodingMethod<'r> {
+    let block_size = predictor_order + residuals.len();
+
+    if options.use_rice2 {
+        try_reduce_rice(best_partitions(options, block_size, residuals))
     } else {
-        let partitions = best_partitions::<0b1111>(options, block_size, residuals);
-        writer.write::<2, u8>(0)?; // coding method 0
-        write_partitions(writer, partitions)
+        CodingMethod::Rice(best_partitions::<0b1111>(options, block_size, residuals))
     }
 }
 
