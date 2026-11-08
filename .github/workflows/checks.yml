@@ -131,7 +131,7 @@ jobs:
       - name: two minutes per target
         run: |
           cd fuzz
-          for target in decode seek metadata roundtrip; do
+          for target in decode seek metadata roundtrip decode_reference; do
             cargo fuzz run "$target" -- -max_total_time=120 -rss_limit_mb=2048 -timeout=10
           done
 

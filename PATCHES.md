@@ -24,12 +24,27 @@ pull request.
 
 ## Speed
 
-Each change keeps the encoder's output byte-identical and sits alone on a `perf-*`
-branch based on upstream `master`.
+Every change keeps the encoder's output byte-identical and the decoder's samples and
+errors the same. The first one sits alone on a `perf-*` branch based on upstream
+`master`; the later ones build on the fixes and on each other (owner's choice
+2026-11-08: build them in the fork), each `perf-*` branch ending at its last commit.
 
 | Commit | Change | `perf-*` branch | Upstream status |
 |---|---|---|---|
 | `772b45a` | Count both subframe candidates (FIXED and LPC) and write only the smaller | `perf-encoder-count-candidates` | not offered yet |
+| `2ddd1c9` | Decode frames from memory with a 64-bit bit reader (`src/frames.rs`): read ahead in 256 KiB pieces, CRC-16 over the frame's bytes afterwards, at most two refills per frame, then the stream path (also for frames over 4 MiB) | `perf-decoder-frames-from-memory` | not offered |
+| `ed19bc0` | Unroll prediction for orders up to 12 | same | not offered |
+| `e1162d8` | Interleave frame samples without collecting each PCM frame | same | not offered |
+| `6b41340` | Read Rice codes in one step (`ReadRice`) | same | not offered |
+| `4fb995d` | Compute CRC-16 eight bytes at a time | same | not offered |
+| `5caa7f5` | Sum residual magnitudes once at the finest partition order | `perf-encoder-partition-sums` | not offered |
+| `7a4c1e0` | Unroll LPC residuals for orders up to 12 | `perf-encoder-unrolled-residuals` | not offered |
+| `532cbf3` | Compute FIXED differences without stopping at each one | `perf-encoder-fixed-differences` | not offered |
+
+Each comes with its own equivalence test: `SliceBitReader` against bitstream-io's
+reader on random operations (Rice codes included), prediction and LPC residuals per
+order against the general loops, FIXED parameters against the previous algorithm,
+interleaving against `MultiZip`, CRC-16 by slices against bytes.
 
 ## Fork only
 
@@ -63,9 +78,15 @@ branch based on upstream `master`.
 crates included), MIT or Apache-2.0 only, one version per crate, crates.io only.
 
 `fuzz/` holds the cargo-fuzz targets `decode` (samples and MD5), `seek`, `metadata`
-(every block that reads must write back and read again unchanged) and `roundtrip`
-(any samples, layout and options must encode and decode to the same samples):
-`cargo +nightly fuzz run <target>`.
+(every block that reads must write back and read again unchanged), `roundtrip`
+(any samples, layout and options must encode and decode to the same samples) and
+`decode_reference` (any input, read in pieces of any size or after a seek, must give
+the samples and the ending of commit `69e7537`, the branch before the decoder speed
+work, fetched from this fork): `cargo +nightly fuzz run <target>`.
+
+`tests/hardening.rs` also checks that decoding from sources handing out 1, 3 or 4093
+bytes per read matches decoding from memory, for undamaged and damaged streams, and
+that a 5 MB frame decodes through the stream fallback.
 
 ## Moving to a new upstream release
 
@@ -105,30 +126,47 @@ crates included), MIT or Apache-2.0 only, one version per crate, crates.io only.
   run found the last two fixes within a minute (`metadata`, `roundtrip`). After them:
   `decode` 430,658 runs, `seek` 216,667,403, `metadata` 128,754,571, `roundtrip`
   4,404,684, nothing found.
-- All 111 tests pass on this branch; the encoder output for the 64 IETF subset files is
+- All 120 tests pass on this branch; the encoder output for the 64 IETF subset files is
   byte-identical to upstream 1.3.3 for the default, best and fast settings.
+- After the decoder speed work (2026-11-08), 30 minutes each with AddressSanitizer:
+  `decode_reference` 103,365 runs with the same samples and endings as `69e7537`
+  (pieces of 1 to 128 bytes, 64 KiB, or after a seek), `decode` 536,271, `seek`
+  210,296,650, nothing found. 1,000,000 damaged streams and 20,000 random encoder rounds
+  with overflow checks and debug assertions: clean. libFLAC 1.5.0 and ffmpeg 8.0.1:
+  288 of 288 streams identical. Heap of a small clean stream: about 300 KiB (the
+  read-ahead), damaged streams at most 527 KiB.
 
-## Speed measurements (2026-11-07, one pinned core, 64 IETF subset files with 98.6 million samples)
+## Speed measurements (2026-11-08, one pinned core, 64 IETF subset files with 98.6 million samples)
 
-Best of 5 runs, three rounds alternating between upstream 1.3.3 and this branch (head
-`772b45a`, all fixes and the speed change above); libFLAC 1.5.0's `flac` on the same core
-in a container:
+Best of 5 runs, three rounds alternating between this branch before the decoder speed
+work (`69e7537`, all fixes and `772b45a`) and after it (`532cbf3`); libFLAC 1.5.0's
+`flac` on the same core in a container. Upstream 1.3.3 measured on 2026-11-07 under the
+same conditions:
 
-| | upstream 1.3.3 | this branch | change | libFLAC 1.5.0 |
+| | upstream 1.3.3 | `69e7537` | `532cbf3` | libFLAC 1.5.0 |
 |---|---|---|---|---|
-| encode, default (`flac -5`) | 5.639 s | 4.637 s | −17.8 % | 1.139 s |
-| encode, best (`flac -8`) | 6.111 s | 5.155 s | −15.6 % | 2.859 s |
-| encode, fast (`flac -0`) | 2.412 s | 2.372 s | −1.7 % | 0.682 s |
-| decode to samples | 1.566 s | 1.534 s | −2.0 % | |
-| decode with MD5 check (`verify`, `flac -t`) | 1.925 s | 1.925 s | none | 0.837 s |
+| decode to samples | 1.566 s | 1.493 s | 0.784 s | |
+| decode with MD5 check (`verify`, `flac -t`) | 1.925 s | 1.936 s | 1.049 s | 0.837 s |
+| encode, default (`flac -5`) | 5.639 s | 4.664 s | 4.174 s | 1.153 s |
+| encode, best (`flac -8`) | 6.111 s | 5.204 s | 4.618 s | 2.867 s |
+| encode, fast (`flac -0`) | 2.412 s | 2.387 s | 2.307 s | 0.680 s |
 
-With `rayon` on all 32 threads, the default encode takes 2.84 s. The presets do not
-match libFLAC's levels exactly, and libFLAC's times include reading WAV files and writing
-FLAC files on tmpfs, while flac-codec works in memory. libFLAC is still 1.8 to 4.1 times
-faster on one core.
+Against upstream 1.3.3, decoding is 2.0 times as fast and decoding with the MD5 check
+1.8 times; encoding takes 26 % less time at the default and best settings. The output
+of the encoder is byte-identical in every column. libFLAC is still 1.25 times as fast
+at checking and 1.6 to 3.6 times at encoding; with `rayon` on all 32 threads the
+default encode took 2.84 s on 2026-11-07.
 
-Where the time goes (callgrind, after the speed change): in the encoder, the LPC search
-and residuals about 13 %, partition estimates 7 %, bit recording 9 %, FIXED residuals 5 %,
-copies 4 %, MD5 2 %; in the decoder, 39 % of all instructions fetch single bytes through
-`CrcReader` for bitstream-io (decoding from memory instead of a `BufReader` saves only
-9 %), residual decoding and prediction most of the rest.
+The presets do not match libFLAC's levels exactly, and libFLAC's times include
+reading WAV files and writing FLAC files on tmpfs, while flac-codec works in memory.
+
+Where the encoder's time goes now (callgrind on a CD file): writing the chosen
+subframes into bit recorders about 20 % (four per stereo frame, of which two are used),
+counting candidates through `BitsWritten` 9 %, FIXED residuals and their order choice
+10 %, copies 4 %, MD5 3 %. Its instructions per sample fell by 22 % with the speed work,
+the time by 11 %: what is left is mostly writing memory.
+
+Next, in this order: compute candidate sizes arithmetically and write only the two
+stereo subframes that are used (the partition code moves out of `write_residuals` for
+that); a word-based bit writer; encoding whole frames in parallel, in order, for the
+wall-clock time of long takes.
