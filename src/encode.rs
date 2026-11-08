@@ -2709,11 +2709,14 @@ fn correlate_channels_exhaustive<'c>(
     [left, right]: [&'c [i32]; 2],
     bits_per_sample: SignedBitCount<32>,
 ) -> Result<Correlated<&'c BitRecorder<u32, BigEndian>>, Error> {
-    let (left_recorder, right_recorder) = try_join(
+    // every candidate channel is planned; only the two chosen are written
+    let (left_planning, left_output) = left_cache.split();
+    let (right_planning, right_output) = right_cache.split();
+    let (left_plan, right_plan) = try_join(
         || {
-            encode_subframe(
+            plan_subframe(
                 options,
-                left_cache,
+                left_planning,
                 CorrelatedChannel {
                     samples: left,
                     bits_per_sample,
@@ -2722,9 +2725,9 @@ fn correlate_channels_exhaustive<'c>(
             )
         },
         || {
-            encode_subframe(
+            plan_subframe(
                 options,
-                right_cache,
+                right_planning,
                 CorrelatedChannel {
                     samples: right,
                     bits_per_sample,
@@ -2734,16 +2737,36 @@ fn correlate_channels_exhaustive<'c>(
         },
     )?;
 
+    let difference = move |difference_samples: &'c mut Vec<i32>,
+                           planning: Planning<'c>,
+                           bits_per_sample: SignedBitCount<32>| {
+        difference_samples.clear();
+        difference_samples.extend(left.iter().zip(right).map(|(l, r)| l - r));
+        let difference_samples: &'c [i32] = difference_samples;
+        plan_subframe(
+            options,
+            planning,
+            CorrelatedChannel {
+                samples: difference_samples,
+                bits_per_sample,
+                all_0: false,
+            },
+        )
+    };
+
     match bits_per_sample.checked_add::<32>(1) {
         Some(difference_bits_per_sample) if options.mid_side => {
-            let (average_recorder, difference_recorder) = try_join(
-                || {
+            let (average_planning, average_output) = average_cache.split();
+            let (difference_planning, difference_output) = difference_cache.split();
+            let (average_plan, difference_plan) = try_join(
+                move || {
                     average_samples.clear();
                     average_samples
                         .extend(left.iter().zip(right.iter()).map(|(l, r)| (l + r) >> 1));
-                    encode_subframe(
+                    let average_samples: &'c [i32] = average_samples;
+                    plan_subframe(
                         options,
-                        average_cache,
+                        average_planning,
                         CorrelatedChannel {
                             samples: average_samples,
                             bits_per_sample,
@@ -2751,17 +2774,11 @@ fn correlate_channels_exhaustive<'c>(
                         },
                     )
                 },
-                || {
-                    difference_samples.clear();
-                    difference_samples.extend(left.iter().zip(right).map(|(l, r)| l - r));
-                    encode_subframe(
-                        options,
-                        difference_cache,
-                        CorrelatedChannel {
-                            samples: difference_samples,
-                            bits_per_sample: difference_bits_per_sample,
-                            all_0: false,
-                        },
+                move || {
+                    difference(
+                        difference_samples,
+                        difference_planning,
+                        difference_bits_per_sample,
                     )
                 },
             )?;
@@ -2769,19 +2786,19 @@ fn correlate_channels_exhaustive<'c>(
             match [
                 (
                     ChannelAssignment::Independent(Independent::Stereo),
-                    left_recorder.written() + right_recorder.written(),
+                    left_plan.bits + right_plan.bits,
                 ),
                 (
                     ChannelAssignment::LeftSide,
-                    left_recorder.written() + difference_recorder.written(),
+                    left_plan.bits + difference_plan.bits,
                 ),
                 (
                     ChannelAssignment::SideRight,
-                    difference_recorder.written() + right_recorder.written(),
+                    difference_plan.bits + right_plan.bits,
                 ),
                 (
                     ChannelAssignment::MidSide,
-                    average_recorder.written() + difference_recorder.written(),
+                    average_plan.bits + difference_plan.bits,
                 ),
             ]
             .into_iter()
@@ -2791,49 +2808,54 @@ fn correlate_channels_exhaustive<'c>(
             {
                 channel_assignment @ ChannelAssignment::LeftSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [left_recorder, difference_recorder],
+                    channels: [
+                        left_plan.record(left_output)?,
+                        difference_plan.record(difference_output)?,
+                    ],
                 }),
                 channel_assignment @ ChannelAssignment::SideRight => Ok(Correlated {
                     channel_assignment,
-                    channels: [difference_recorder, right_recorder],
+                    channels: [
+                        difference_plan.record(difference_output)?,
+                        right_plan.record(right_output)?,
+                    ],
                 }),
                 channel_assignment @ ChannelAssignment::MidSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [average_recorder, difference_recorder],
+                    channels: [
+                        average_plan.record(average_output)?,
+                        difference_plan.record(difference_output)?,
+                    ],
                 }),
                 channel_assignment @ ChannelAssignment::Independent(_) => Ok(Correlated {
                     channel_assignment,
-                    channels: [left_recorder, right_recorder],
+                    channels: [
+                        left_plan.record(left_output)?,
+                        right_plan.record(right_output)?,
+                    ],
                 }),
             }
         }
         Some(difference_bits_per_sample) => {
-            let difference_recorder = {
-                difference_samples.clear();
-                difference_samples.extend(left.iter().zip(right).map(|(l, r)| l - r));
-                encode_subframe(
-                    options,
-                    difference_cache,
-                    CorrelatedChannel {
-                        samples: difference_samples,
-                        bits_per_sample: difference_bits_per_sample,
-                        all_0: false,
-                    },
-                )?
-            };
+            let (difference_planning, difference_output) = difference_cache.split();
+            let difference_plan = difference(
+                difference_samples,
+                difference_planning,
+                difference_bits_per_sample,
+            )?;
 
             match [
                 (
                     ChannelAssignment::Independent(Independent::Stereo),
-                    left_recorder.written() + right_recorder.written(),
+                    left_plan.bits + right_plan.bits,
                 ),
                 (
                     ChannelAssignment::LeftSide,
-                    left_recorder.written() + difference_recorder.written(),
+                    left_plan.bits + difference_plan.bits,
                 ),
                 (
                     ChannelAssignment::SideRight,
-                    difference_recorder.written() + right_recorder.written(),
+                    difference_plan.bits + right_plan.bits,
                 ),
             ]
             .into_iter()
@@ -2843,16 +2865,25 @@ fn correlate_channels_exhaustive<'c>(
             {
                 channel_assignment @ ChannelAssignment::LeftSide => Ok(Correlated {
                     channel_assignment,
-                    channels: [left_recorder, difference_recorder],
+                    channels: [
+                        left_plan.record(left_output)?,
+                        difference_plan.record(difference_output)?,
+                    ],
                 }),
                 channel_assignment @ ChannelAssignment::SideRight => Ok(Correlated {
                     channel_assignment,
-                    channels: [difference_recorder, right_recorder],
+                    channels: [
+                        difference_plan.record(difference_output)?,
+                        right_plan.record(right_output)?,
+                    ],
                 }),
                 ChannelAssignment::MidSide => unreachable!(),
                 channel_assignment @ ChannelAssignment::Independent(_) => Ok(Correlated {
                     channel_assignment,
-                    channels: [left_recorder, right_recorder],
+                    channels: [
+                        left_plan.record(left_output)?,
+                        right_plan.record(right_output)?,
+                    ],
                 }),
             }
         }
@@ -2862,7 +2893,10 @@ fn correlate_channels_exhaustive<'c>(
 
             Ok(Correlated {
                 channel_assignment: ChannelAssignment::Independent(Independent::Stereo),
-                channels: [left_recorder, right_recorder],
+                channels: [
+                    left_plan.record(left_output)?,
+                    right_plan.record(right_output)?,
+                ],
             })
         }
     }
