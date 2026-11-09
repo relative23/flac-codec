@@ -639,6 +639,12 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
     }
 }
 
+impl<W: std::io::Write + std::io::Seek> Drop for FlacSampleWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.finalize_inner();
+    }
+}
+
 impl FlacSampleWriter<BufWriter<File>> {
     /// Creates new FLAC file at the given path
     ///
@@ -951,6 +957,12 @@ impl<W: std::io::Write + std::io::Seek> FlacChannelWriter<W> {
     pub fn finalize(mut self) -> Result<(), Error> {
         self.finalize_inner()?;
         Ok(())
+    }
+}
+
+impl<W: std::io::Write + std::io::Seek> Drop for FlacChannelWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.finalize_inner();
     }
 }
 
