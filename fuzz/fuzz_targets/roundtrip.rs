@@ -20,6 +20,7 @@ struct Input {
     fast_channel_correlation: bool,
     window: (u8, f32),
     total_known: bool,
+    threads: u8,
     piece: u16,
     samples: Vec<i32>,
 }
@@ -42,7 +43,8 @@ fuzz_target!(|input: Input| {
         .unwrap()
         .mid_side(input.mid_side)
         .fast_channel_correlation(input.fast_channel_correlation)
-        .window(window);
+        .window(window)
+        .threads(std::num::NonZero::new(1 + usize::from(input.threads % 4)).unwrap());
 
     // sign-extend each sample from `bits`, so every value of the range is reachable
     let mut samples: Vec<i32> = input

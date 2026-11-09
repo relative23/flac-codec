@@ -484,6 +484,172 @@ fn encoder_random_inputs_round_trip() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Encoding on several threads writes the same bytes as on one, for every
+/// writer type, with and without a known total, and with a short last frame
+#[test]
+fn threads_write_the_same_bytes() {
+    use flac_codec::byteorder::LittleEndian;
+    use flac_codec::encode::{FlacByteWriter, FlacChannelWriter};
+    use std::io::Write;
+    use std::num::NonZero;
+
+    let mut rng = Rng(0x7E7E_AD5E_ED01);
+    for round in 0..40 {
+        let bits = [8u32, 16, 24, 32][round % 4];
+        let channels = 1 + rng.below(4) as u8;
+        let frames = 1 + rng.below(60000);
+        let samples = random_signal(&mut rng, bits, channels.into(), frames);
+        let total = (rng.below(2) == 0).then_some(samples.len() as u64);
+        let base = Options::default()
+            .block_size([192, 1152, 4096][rng.below(3)])
+            .unwrap()
+            .seektable_frames(1 + rng.below(20));
+        let piece = usize::from(channels) * (1 + rng.below(9000));
+
+        let sample_writer = |threads: usize| {
+            let mut flac = Cursor::new(vec![]);
+            let options = base.clone().threads(NonZero::new(threads).unwrap());
+            let mut w =
+                FlacSampleWriter::new(&mut flac, options, 44100, bits, channels, total).unwrap();
+            samples.chunks(piece).for_each(|p| w.write(p).unwrap());
+            w.finalize().unwrap();
+            flac.into_inner()
+        };
+        let byte_writer = |threads: usize| {
+            let bytes: Vec<u8> = samples
+                .iter()
+                .flat_map(|s| s.to_le_bytes()[..bits.div_ceil(8) as usize].to_vec())
+                .collect();
+            let mut flac = Cursor::new(vec![]);
+            let options = base.clone().threads(NonZero::new(threads).unwrap());
+            let mut w = FlacByteWriter::endian(
+                &mut flac,
+                LittleEndian,
+                options,
+                44100,
+                bits,
+                channels,
+                total.map(|t| t * u64::from(bits.div_ceil(8))),
+            )
+            .unwrap();
+            bytes
+                .chunks(piece * 3)
+                .for_each(|p| w.write_all(p).unwrap());
+            w.finalize().unwrap();
+            flac.into_inner()
+        };
+        let channel_writer = |threads: usize| {
+            let split: Vec<Vec<i32>> = (0..usize::from(channels))
+                .map(|c| {
+                    samples
+                        .iter()
+                        .skip(c)
+                        .step_by(channels.into())
+                        .copied()
+                        .collect()
+                })
+                .collect();
+            let mut flac = Cursor::new(vec![]);
+            let options = base.clone().threads(NonZero::new(threads).unwrap());
+            let mut w = FlacChannelWriter::new(
+                &mut flac,
+                options,
+                44100,
+                bits,
+                channels,
+                total.map(|t| t / u64::from(channels)),
+            )
+            .unwrap();
+            let step = piece / usize::from(channels);
+            for start in (0..frames).step_by(step) {
+                let end = (start + step).min(frames);
+                w.write(split.iter().map(|c| &c[start..end]).collect::<Vec<_>>())
+                    .unwrap();
+            }
+            w.finalize().unwrap();
+            flac.into_inner()
+        };
+
+        // dropping the writer instead of finalizing it writes the queued frames,
+        // as it writes the frames of one thread
+        let dropped = |threads: usize| {
+            let mut flac = Cursor::new(vec![]);
+            let options = base.clone().threads(NonZero::new(threads).unwrap());
+            let mut w =
+                FlacSampleWriter::new(&mut flac, options, 44100, bits, channels, total).unwrap();
+            samples.chunks(piece).for_each(|p| w.write(p).unwrap());
+            drop(w);
+            flac.into_inner()
+        };
+
+        let one = sample_writer(1);
+        assert_eq!(decode(&one).unwrap(), samples, "round {round}");
+        assert_eq!(dropped(4), dropped(1), "round {round}, dropped");
+        for threads in [2, 3, 8] {
+            assert_eq!(
+                sample_writer(threads),
+                one,
+                "round {round}, {threads} threads"
+            );
+        }
+        assert_eq!(byte_writer(3), byte_writer(1), "round {round}, bytes");
+        assert_eq!(
+            channel_writer(3),
+            channel_writer(1),
+            "round {round}, channels"
+        );
+    }
+}
+
+/// Writing more samples than declared fails the same way on several threads:
+/// the same error, and the same frames before it
+#[test]
+fn threads_fail_the_same_way() {
+    use std::num::NonZero;
+
+    let samples = signal(Kind::Tones, 16, 2, 50000, 3);
+    let attempt = |threads: usize| {
+        let mut flac = Cursor::new(vec![]);
+        let options = Options::default()
+            .block_size(1152)
+            .unwrap()
+            .threads(NonZero::new(threads).unwrap());
+        let mut w = FlacSampleWriter::new(
+            &mut flac,
+            options,
+            44100,
+            16,
+            2,
+            Some(samples.len() as u64 / 2),
+        )
+        .unwrap();
+        // the error may come from a later write or from finalizing
+        let written = samples
+            .chunks(2 * 1000)
+            .map(|p| w.write(p))
+            .find_map(Result::err);
+        let error = match written {
+            Some(err) => {
+                // dropping the writer finalizes what it can
+                drop(w);
+                Some(err)
+            }
+            None => w.finalize().err(),
+        }
+        .map(|err| format!("{err:?}"));
+        (error, flac.into_inner())
+    };
+    let (error, bytes) = attempt(1);
+    assert_eq!(error.as_deref(), Some("ExcessiveTotalSamples"));
+    for threads in [2, 5] {
+        assert_eq!(
+            attempt(threads),
+            (error.clone(), bytes.clone()),
+            "{threads} threads"
+        );
+    }
+}
+
 /// Decodes `flac` with an external program into signed 32-bit little-endian samples,
 /// shifted back to `bits`.
 fn external(program: &str, args: &[&str], raw: &std::path::Path, bits: u32) -> Vec<i32> {

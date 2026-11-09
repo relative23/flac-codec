@@ -1318,6 +1318,7 @@ pub struct Options {
     max_lpc_order: Option<NonZero<u8>>,
     window: Window,
     exhaustive_channel_correlation: bool,
+    threads: NonZero<usize>,
 }
 
 impl Default for Options {
@@ -1350,6 +1351,7 @@ impl Default for Options {
             max_lpc_order: NonZero::new(8),
             window: Window::default(),
             exhaustive_channel_correlation: true,
+            threads: NonZero::<usize>::MIN,
         }
     }
 }
@@ -1421,6 +1423,18 @@ impl Options {
             exhaustive_channel_correlation: !fast,
             ..self
         }
+    }
+
+    /// How many frames to encode at once, each on its own thread
+    ///
+    /// The output is the same for any number. The default is 1, which
+    /// encodes every frame as soon as its samples are written. With more,
+    /// frames are collected and encoded together, so an error in a frame
+    /// is returned when its group is encoded, by a later write or by
+    /// finalizing, rather than by the write that completed the frame.
+    /// Up to four frames per thread are held in memory.
+    pub fn threads(self, threads: NonZero<usize>) -> Self {
+        Self { threads, ..self }
     }
 
     /// Updates size of padding block
@@ -1834,6 +1848,40 @@ struct Encoder<W: std::io::Write + std::io::Seek> {
     md5: md5::Context,
     // whether the encoder has finalized the file
     finalized: Finalized,
+    // frames waiting to be encoded together on several threads
+    queue: FrameQueue,
+}
+
+/// Frames collected to be encoded on several threads, and what the threads use
+struct FrameQueue {
+    threads: NonZero<usize>,
+    // the first `len` are queued; the rest keep their allocations
+    frames: Vec<Frame>,
+    // each queued frame's first sample, for its seekpoint
+    offsets: Vec<u64>,
+    len: usize,
+    // one set of caches per thread
+    workers: Vec<EncodingCaches>,
+    // each queued frame, encoded
+    encoded: Vec<Vec<u8>>,
+}
+
+impl FrameQueue {
+    fn new(threads: NonZero<usize>) -> Self {
+        Self {
+            threads,
+            frames: Vec::new(),
+            offsets: Vec::new(),
+            len: 0,
+            workers: Vec::new(),
+            encoded: Vec::new(),
+        }
+    }
+
+    /// How many frames are encoded together
+    fn capacity(&self) -> usize {
+        self.threads.get() * 4
+    }
 }
 
 impl<W: std::io::Write + std::io::Seek> Encoder<W> {
@@ -1936,6 +1984,7 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
             seekpoints: Vec::new(),
             md5: md5::Context::new(),
             finalized: Finalized::NotFinalized,
+            queue: FrameQueue::new(options.threads),
         })
     }
 
@@ -1954,7 +2003,11 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
     /// Returns an I/O error from the underlying stream,
     /// or if the frame's parameters are not a match
     /// for the encoder's.
-    fn encode(&mut self, frame: &Frame) -> Result<(), Error> {
+    fn encode(&mut self, frame: &mut Frame) -> Result<(), Error> {
+        if self.queue.threads.get() > 1 {
+            return self.queue_frame(frame);
+        }
+
         // drop in a new seekpoint
         self.seekpoints.push(EncoderSeekPoint {
             sample_offset: self.samples_written,
@@ -1981,7 +2034,130 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
         )
     }
 
+    /// Queues a frame to be encoded with others on several threads;
+    /// the same as `encode` once the queue is flushed.
+    ///
+    /// The frame's buffer moves into the queue: the caller gets back a
+    /// spare one of the same layout to fill next.
+    fn queue_frame(&mut self, frame: &mut Frame) -> Result<(), Error> {
+        let offset = self.samples_written;
+
+        // update running total of samples written
+        self.samples_written += frame.pcm_frames() as u64;
+        if let Some(total_samples) = self.blocks.streaminfo().total_samples
+            && self.samples_written > total_samples.get()
+        {
+            // as `encode` does: the frames before, then this frame's seekpoint
+            self.flush()?;
+            self.seekpoints.push(EncoderSeekPoint {
+                sample_offset: offset,
+                byte_offset: Some(self.writer.count),
+                frame_samples: frame.pcm_frames() as u16,
+            });
+            return Err(Error::ExcessiveTotalSamples);
+        }
+
+        let queue = &mut self.queue;
+        if queue.frames.len() == queue.len {
+            queue.frames.push(frame.clone());
+            queue.offsets.push(offset);
+        } else {
+            std::mem::swap(frame, &mut queue.frames[queue.len]);
+            queue.offsets[queue.len] = offset;
+        }
+        queue.len += 1;
+
+        if queue.len == queue.capacity() {
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Encodes the queued frames on several threads and writes them in order,
+    /// exactly as `encode` would have one by one
+    fn flush(&mut self) -> Result<(), Error> {
+        let queue = &mut self.queue;
+        let count = std::mem::take(&mut queue.len);
+        if count == 0 {
+            return Ok(());
+        }
+
+        // the frame numbers `encode` would give them
+        let mut frame_numbers = Vec::with_capacity(count);
+        let mut frame_number = self.frame_number;
+        for _ in 0..count {
+            frame_numbers.push(frame_number);
+            if frame_number.try_increment().is_err() {
+                // this frame is the last `encode` writes
+                break;
+            }
+        }
+        let encodable = frame_numbers.len();
+
+        let threads = queue.threads.get().min(encodable);
+        queue.workers.resize_with(threads, EncodingCaches::default);
+        if queue.encoded.len() < encodable {
+            queue.encoded.resize_with(encodable, Vec::new);
+        }
+        let per_thread = encodable.div_ceil(threads);
+        let (options, streaminfo, sample_rate) =
+            (&self.options, self.blocks.streaminfo(), self.sample_rate);
+        let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = queue.frames[..encodable]
+                .chunks(per_thread)
+                .zip(queue.encoded[..encodable].chunks_mut(per_thread))
+                .zip(frame_numbers.chunks(per_thread))
+                .zip(queue.workers.iter_mut())
+                .map(|(((frames, encoded), numbers), worker)| {
+                    scope.spawn(move || {
+                        frames
+                            .iter()
+                            .zip(encoded)
+                            .zip(numbers)
+                            .map(|((frame, buf), number)| {
+                                encode_frame_bytes(
+                                    options,
+                                    worker,
+                                    buf,
+                                    streaminfo,
+                                    *number,
+                                    sample_rate,
+                                    frame.channels().collect(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .flat_map(|job| job.join().expect("encoding thread panicked"))
+                .collect()
+        });
+
+        // write them in order, with what `encode` does around each frame
+        for (i, result) in results.into_iter().enumerate() {
+            let frame = &self.queue.frames[i];
+            self.seekpoints.push(EncoderSeekPoint {
+                sample_offset: self.queue.offsets[i],
+                byte_offset: Some(self.writer.count),
+                frame_samples: frame.pcm_frames() as u16,
+            });
+            result?;
+            write_encoded_frame(
+                &mut self.writer,
+                &self.queue.encoded[i],
+                self.blocks.streaminfo_mut(),
+                &mut self.frame_number,
+            )?;
+        }
+        Ok(())
+    }
+
     fn finalize_inner(&mut self) -> Result<(), Error> {
+        if matches!(self.finalized, Finalized::NotFinalized) {
+            self.flush()?;
+        }
         if matches!(std::mem::take(&mut self.finalized), Finalized::NotFinalized) {
             use crate::metadata::SeekTable;
 
@@ -2316,7 +2492,7 @@ fn write_frame_bytes(
 fn encode_frame<W>(
     options: &EncoderOptions,
     cache: &mut EncodingCaches,
-    mut writer: W,
+    writer: W,
     streaminfo: &mut Streaminfo,
     frame_number: &mut FrameNumber,
     sample_rate: SampleRate<u32>,
@@ -2325,19 +2501,39 @@ fn encode_frame<W>(
 where
     W: std::io::Write,
 {
+    let mut buf = std::mem::take(&mut cache.frame);
+    let encoded = encode_frame_bytes(
+        options,
+        cache,
+        &mut buf,
+        streaminfo,
+        *frame_number,
+        sample_rate,
+        frame,
+    )
+    .and_then(|()| write_encoded_frame(writer, &buf, streaminfo, frame_number));
+    cache.frame = buf;
+    encoded
+}
+
+/// Encodes a whole frame into `buf`, replacing what it held
+fn encode_frame_bytes(
+    options: &EncoderOptions,
+    cache: &mut EncodingCaches,
+    buf: &mut Vec<u8>,
+    streaminfo: &Streaminfo,
+    frame_number: FrameNumber,
+    sample_rate: SampleRate<u32>,
+    frame: ArrayVec<&[i32], MAX_CHANNELS>,
+) -> Result<(), Error> {
     use crate::stream::FrameHeader;
 
     debug_assert!(!frame.is_empty());
 
-    let EncodingCaches {
-        channels: caches,
-        correlated,
-        frame: buf,
-    } = cache;
     let (channel_assignment, plans) = plan_frame(
         options,
-        caches,
-        correlated,
+        &mut cache.channels,
+        &mut cache.correlated,
         &frame,
         streaminfo.bits_per_sample,
     )?;
@@ -2346,7 +2542,7 @@ where
         |header| {
             FrameHeader {
                 blocking_strategy: false,
-                frame_number: *frame_number,
+                frame_number,
                 block_size: (frame[0].len() as u16)
                     .try_into()
                     .expect("frame cannot be empty"),
@@ -2357,7 +2553,17 @@ where
             .write(header, streaminfo)
         },
         &plans,
-    )?;
+    )
+}
+
+/// Writes an encoded frame to the output, moves to the next frame number,
+/// and updates the minimum and maximum frame sizes
+fn write_encoded_frame<W: std::io::Write>(
+    mut writer: W,
+    buf: &[u8],
+    streaminfo: &mut Streaminfo,
+    frame_number: &mut FrameNumber,
+) -> Result<(), Error> {
     writer.write_all(buf)?;
 
     frame_number.try_increment()?;
