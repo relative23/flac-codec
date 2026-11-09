@@ -570,8 +570,7 @@ fn threads_write_the_same_bytes() {
             flac.into_inner()
         };
 
-        // dropping the writer instead of finalizing it writes the queued frames,
-        // as it writes the frames of one thread
+        // dropping the writer instead of finalizing it writes the same stream
         let dropped = |threads: usize| {
             let mut flac = Cursor::new(vec![]);
             let options = base.clone().threads(NonZero::new(threads).unwrap());
@@ -584,7 +583,8 @@ fn threads_write_the_same_bytes() {
 
         let one = sample_writer(1);
         assert_eq!(decode(&one).unwrap(), samples, "round {round}");
-        assert_eq!(dropped(4), dropped(1), "round {round}, dropped");
+        assert_eq!(dropped(1), one, "round {round}, dropped");
+        assert_eq!(dropped(4), one, "round {round}, dropped with 4 threads");
         for threads in [2, 3, 8] {
             assert_eq!(
                 sample_writer(threads),
