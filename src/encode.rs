@@ -3300,11 +3300,12 @@ fn fixed_parameters<'c>(
             let prev_order = fixed_orders.last().unwrap();
             match prev_order.split_at_checked(1) {
                 Some((_, r)) => {
-                    buf.clear();
                     // every difference, then whether one overflowed, which stops
                     // at the same order as checking each one: `n - p` overflows
                     // where the signs of `n` and `p` differ and the difference
                     // has the sign of `p`, which sets the sign bit of `overflow`
+                    // (the buffer keeps its length from the last block, so that
+                    // only a change of length fills anything: every value is written)
                     buf.resize(r.len(), 0);
                     let mut overflow = 0;
                     for ((difference, n), p) in buf.iter_mut().zip(r).zip(*prev_order) {
@@ -3381,12 +3382,14 @@ fn fixed_parameters_match_checking_each_difference() {
         seed ^= seed << 17;
         seed
     };
-    for round in 0..400 {
+    // one cache for every round, as the encoder reuses it from block to block,
+    // so that nothing left in its buffers by a longer block may show
+    let mut cache = FixedCache::default();
+    for round in 0..600 {
         // full-scale 32-bit values overflow their differences, smaller ones do not
         let bits = [8, 16, 24, 30, 32][round % 5];
         let len = 1 + (next() % 300) as usize;
         let channel: Vec<i32> = (0..len).map(|_| (next() as i32) >> (32 - bits)).collect();
-        let mut cache = FixedCache::default();
         let (order, warm_up, residuals) = fixed_parameters(&mut cache, &channel);
         let (expected_order, expected_residuals) = previous(&channel);
         assert_eq!(order, expected_order, "round {round}");
