@@ -149,7 +149,7 @@ impl Frame {
     }
 
     /// Fills frame samples from bytes of the given endianness
-    pub fn fill_from_buf<E: crate::byteorder::Endianness>(&mut self, buf: &[u8]) -> &Self {
+    pub fn fill_from_buf<E: crate::byteorder::Endianness>(&mut self, buf: &[u8]) -> &mut Self {
         match self.bytes_per_sample() {
             1 => {
                 self.channel_len = buf.len() / self.channels;
@@ -190,12 +190,32 @@ impl Frame {
     }
 
     /// Fills frame samples from interleaved samples
-    pub fn fill_from_samples(&mut self, samples: &[i32]) -> &Self {
+    pub fn fill_from_samples(&mut self, samples: &[i32]) -> &mut Self {
         self.channel_len = samples.len() / self.channels;
         self.samples.resize(samples.len(), 0);
 
-        for (o, i) in self.iter_mut().zip(samples) {
-            *o = *i;
+        // each channel's samples in turn, from whole PCM frames
+        let len = self.channel_len;
+        match self.channels {
+            1 => self.samples[..len].copy_from_slice(&samples[..len]),
+            2 => {
+                let (left, right) = self.samples.split_at_mut(len);
+                for ((l, r), pair) in left
+                    .iter_mut()
+                    .zip(&mut right[..len])
+                    .zip(samples.as_chunks::<2>().0)
+                {
+                    *l = pair[0];
+                    *r = pair[1];
+                }
+            }
+            channels => {
+                for (i, frame) in samples.chunks_exact(channels).enumerate() {
+                    for (c, sample) in frame.iter().enumerate() {
+                        self.samples[c * len + i] = *sample;
+                    }
+                }
+            }
         }
 
         self
@@ -205,7 +225,7 @@ impl Frame {
     ///
     /// Channel count must match our internal channel count
     /// (Which must be at least 1 channel)
-    pub fn fill_from_channels<C, S>(&mut self, channels: C) -> &Self
+    pub fn fill_from_channels<C, S>(&mut self, channels: C) -> &mut Self
     where
         C: AsRef<[S]>,
         S: AsRef<[i32]>,
@@ -318,6 +338,29 @@ fn interleaves_like_multizip() {
                 expected,
                 "{channels} channels, {len}"
             );
+        }
+    }
+}
+
+#[test]
+fn fills_from_samples_like_multizip() {
+    for channels in 1..=8 {
+        for len in [1, 7, 4096] {
+            let samples: Vec<i32> = (0..(channels * len) as i32).map(|i| i * 3 - 7).collect();
+            let mut frame = Frame::empty(channels, 16);
+            frame.fill_from_samples(&samples);
+            // the previous way: every interleaved position in turn
+            let mut expected = Frame::empty(channels, 16);
+            expected.channel_len = len;
+            expected.samples.resize(samples.len(), 0);
+            for (o, i) in expected.iter_mut().zip(&samples) {
+                *o = *i;
+            }
+            assert_eq!(
+                frame.samples, expected.samples,
+                "{channels} channels, {len}"
+            );
+            assert_eq!(frame.channel_len, len);
         }
     }
 }

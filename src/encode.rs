@@ -557,19 +557,32 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
     /// This may output 0 or more actual FLAC frames,
     /// depending on the quantity of samples and the amount
     /// previously written.
-    pub fn write(&mut self, samples: &[i32]) -> Result<(), Error> {
-        // dump whole set of samples into our internal buffer
-        self.sample_buf.extend(samples);
-
-        // encode as many FLAC frames as possible (which may be 0)
-        let mut encoded_frames = 0;
-        for buf in self
-            .sample_buf
-            .as_mut_slice()
-            .chunks_exact_mut(self.frame_sample_size)
-        {
+    pub fn write(&mut self, mut samples: &[i32]) -> Result<(), Error> {
+        // the same frames as buffering every sample first: a partly filled
+        // frame is completed, then whole frames are taken from `samples`,
+        // and only the rest is buffered
+        if !self.sample_buf.is_empty() {
+            let wanted = self.frame_sample_size - self.sample_buf.len();
+            let (head, rest) = samples.split_at(wanted.min(samples.len()));
+            self.sample_buf.extend(head);
+            samples = rest;
+            if self.sample_buf.len() < self.frame_sample_size {
+                return Ok(());
+            }
             // update running MD5 sum calculation
             // since samples are already interleaved in channel order
+            update_md5(
+                &mut self.encoder.md5,
+                self.sample_buf.iter().copied(),
+                self.bytes_per_sample,
+            );
+            self.encoder
+                .encode(self.frame.fill_from_samples(&self.sample_buf))?;
+            self.sample_buf.clear();
+        }
+
+        let mut frames = samples.chunks_exact(self.frame_sample_size);
+        for buf in &mut frames {
             update_md5(
                 &mut self.encoder.md5,
                 buf.iter().copied(),
@@ -578,11 +591,8 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
 
             // encode fresh FLAC frame
             self.encoder.encode(self.frame.fill_from_samples(buf))?;
-
-            encoded_frames += 1;
         }
-        self.sample_buf
-            .drain(0..self.frame_sample_size * encoded_frames);
+        self.sample_buf.extend(frames.remainder());
 
         Ok(())
     }
@@ -1196,28 +1206,61 @@ impl<W: std::io::Write> FlacStreamWriter<W> {
 fn update_md5(md5: &mut md5::Context, samples: impl Iterator<Item = i32>, bytes_per_sample: usize) {
     use crate::byteorder::{Endianness, LittleEndian};
 
+    // the samples' bytes go to the MD5 a buffer at a time, which gives the same
+    // sum as one sample at a time; 3072 holds whole samples of 1 to 4 bytes
+    fn consume<const N: usize>(
+        md5: &mut md5::Context,
+        samples: impl Iterator<Item = i32>,
+        to_bytes: impl Fn(i32) -> [u8; N],
+    ) {
+        let mut buf = [0u8; 3072];
+        let mut len = 0;
+        for sample in samples {
+            buf[len..len + N].copy_from_slice(&to_bytes(sample));
+            len += N;
+            if len == buf.len() {
+                md5.consume(buf);
+                len = 0;
+            }
+        }
+        md5.consume(&buf[..len]);
+    }
+
     match bytes_per_sample {
-        1 => {
-            for s in samples {
-                md5.consume(LittleEndian::i8_to_bytes(s as i8));
-            }
-        }
-        2 => {
-            for s in samples {
-                md5.consume(LittleEndian::i16_to_bytes(s as i16));
-            }
-        }
-        3 => {
-            for s in samples {
-                md5.consume(LittleEndian::i24_to_bytes(s));
-            }
-        }
-        4 => {
-            for s in samples {
-                md5.consume(LittleEndian::i32_to_bytes(s));
-            }
-        }
+        1 => consume(md5, samples, |s| LittleEndian::i8_to_bytes(s as i8)),
+        2 => consume(md5, samples, |s| LittleEndian::i16_to_bytes(s as i16)),
+        3 => consume(md5, samples, LittleEndian::i24_to_bytes),
+        4 => consume(md5, samples, LittleEndian::i32_to_bytes),
         _ => panic!("unsupported number of bytes per sample"),
+    }
+}
+
+#[test]
+fn md5_by_buffers_matches_md5_by_samples() {
+    use crate::byteorder::{Endianness, LittleEndian};
+
+    for bytes in 1..=4 {
+        for len in [0usize, 1, 1023, 1024, 1025, 5000] {
+            let samples: Vec<i32> = (0..len as i32)
+                .map(|i| i.wrapping_mul(2_654_435_761u32 as i32))
+                .collect();
+            let mut by_buffers = md5::Context::new();
+            update_md5(&mut by_buffers, samples.iter().copied(), bytes);
+            let mut by_samples = md5::Context::new();
+            for s in &samples {
+                match bytes {
+                    1 => by_samples.consume(LittleEndian::i8_to_bytes(*s as i8)),
+                    2 => by_samples.consume(LittleEndian::i16_to_bytes(*s as i16)),
+                    3 => by_samples.consume(LittleEndian::i24_to_bytes(*s)),
+                    _ => by_samples.consume(LittleEndian::i32_to_bytes(*s)),
+                }
+            }
+            assert_eq!(
+                by_buffers.finalize().0,
+                by_samples.finalize().0,
+                "{bytes} bytes, {len}"
+            );
+        }
     }
 }
 
