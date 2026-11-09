@@ -3913,20 +3913,118 @@ fn autocorrelate(
 
     debug_assert!(usize::from(max_lpc_order.get()) <= MAX_LPC_COEFFS);
 
-    let mut tail = windowed;
-    // let mut autocorrelated = Vec::with_capacity(max_lpc_order.get().into());
-    let mut autocorrelated = ArrayVec::default();
+    // one lag per order and lag 0, as far as there are samples
+    let lags = (usize::from(max_lpc_order.get()) + 1).min(windowed.len());
+    if lags == 0 {
+        return ArrayVec::default();
+    }
 
-    for _ in 0..=max_lpc_order.get() {
-        if tail.is_empty() {
-            return autocorrelated;
-        } else {
-            autocorrelated.push(windowed.iter().zip(tail).map(|(x, y)| x * y).sum());
-            tail.split_off_first();
+    // All lags in one pass over the samples. Each lag's sum still adds its
+    // products in sample order, starting from what an empty sum is, so every
+    // value is bit for bit what summing lag by lag gives.
+    let mut sums = [std::iter::empty::<f64>().sum::<f64>(); MAX_LPC_COEFFS + 1];
+
+    // fixed-size loops for the usual orders (up to 12), which the compiler
+    // unrolls; the same sums as the general loop
+    macro_rules! lags {
+        ($($n:literal)*) => {
+            match lags {
+                $($n => {
+                    if let Some(sums) = sums.first_chunk_mut::<$n>() {
+                        whole_window_sums(windowed, sums);
+                    }
+                })*
+                _ => {
+                    for window in windowed.windows(lags) {
+                        let x = window[0];
+                        for (sum, y) in sums[..lags].iter_mut().zip(window) {
+                            *sum += x * y;
+                        }
+                    }
+                }
+            }
+        };
+    }
+    lags!(2 3 4 5 6 7 8 9 10 11 12 13);
+    // the last samples have partners for the shorter lags only
+    for start in windowed.len() - lags + 1..windowed.len() {
+        let rest = &windowed[start..];
+        let x = rest[0];
+        for (sum, y) in sums.iter_mut().zip(rest) {
+            *sum += x * y;
         }
     }
 
-    autocorrelated
+    sums[..lags].iter().copied().collect()
+}
+
+/// Adds to each of `L` lags' sums the products of every sample that has
+/// partners for all of them
+#[inline]
+fn whole_window_sums<const L: usize>(windowed: &[f64], sums: &mut [f64; L]) {
+    for window in windowed.windows(L) {
+        let Some(window) = window.first_chunk::<L>() else {
+            return;
+        };
+        let x = window[0];
+        for (sum, y) in sums.iter_mut().zip(window) {
+            *sum += x * y;
+        }
+    }
+}
+
+#[test]
+fn autocorrelation_matches_summing_lag_by_lag() {
+    // the previous algorithm
+    fn previous(windowed: &[f64], max_lpc_order: u8) -> Vec<f64> {
+        let mut tail = windowed;
+        let mut autocorrelated = vec![];
+        for _ in 0..=max_lpc_order {
+            if tail.is_empty() {
+                return autocorrelated;
+            }
+            autocorrelated.push(windowed.iter().zip(tail).map(|(x, y)| x * y).sum());
+            tail = &tail[1..];
+        }
+        autocorrelated
+    }
+
+    let mut seed = 0xA076_1D64_78BD_642Fu64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..160 {
+        let len = match round % 4 {
+            0 => (next() % 40) as usize,
+            1 => 4096,
+            _ => (next() % 700) as usize,
+        };
+        // windowed samples as the encoder has them, with zeros of both signs
+        let windowed: Vec<f64> = (0..len)
+            .map(|_| match next() % 16 {
+                0 => 0.0,
+                1 => -0.0,
+                _ => f64::from(next() as i32 >> (next() % 24)) * ((next() % 1000) as f64 / 999.0),
+            })
+            .collect();
+        for order in 1u8..=32 {
+            let expected: Vec<u64> = previous(&windowed, order)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let fast: Vec<u64> = autocorrelate(&windowed, NonZero::new(order).unwrap())
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                fast, expected,
+                "round {round}, {len} samples, order {order}"
+            );
+        }
+    }
 }
 
 #[test]
