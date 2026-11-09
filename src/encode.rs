@@ -3302,14 +3302,16 @@ fn fixed_parameters<'c>(
                 Some((_, r)) => {
                     buf.clear();
                     // every difference, then whether one overflowed, which stops
-                    // at the same order as checking each one
-                    let mut overflow = false;
-                    buf.extend(r.iter().zip(*prev_order).map(|(n, p)| {
-                        let difference = i64::from(*n) - i64::from(*p);
-                        overflow |= difference != i64::from(difference as i32);
-                        difference as i32
-                    }));
-                    if overflow {
+                    // at the same order as checking each one: `n - p` overflows
+                    // where the signs of `n` and `p` differ and the difference
+                    // has the sign of `p`, which sets the sign bit of `overflow`
+                    buf.resize(r.len(), 0);
+                    let mut overflow = 0;
+                    for ((difference, n), p) in buf.iter_mut().zip(r).zip(*prev_order) {
+                        *difference = n.wrapping_sub(*p);
+                        overflow |= (n ^ p) & (n ^ *difference);
+                    }
+                    if overflow < 0 {
                         break 'outer;
                     }
                     if buf.is_empty() {
