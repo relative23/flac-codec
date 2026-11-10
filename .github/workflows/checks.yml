@@ -1,8 +1,8 @@
 # Checks of the NASTRA branch (see PATCHES.md): upstream's tests on four platforms with
 # and without rayon, the minimum Rust version, formatting and clippy against upstream,
 # damaged streams and random encoder input in a release build with overflow checks,
-# libFLAC and ffmpeg decoding what the encoder writes, cargo deny, and a short round of
-# coverage-guided fuzzing.
+# libFLAC and ffmpeg decoding what the encoder writes, all of these again in a build
+# for processors with AVX2, cargo deny, and a short round of coverage-guided fuzzing.
 name: checks
 
 on:
@@ -107,6 +107,33 @@ jobs:
       - run: flac --version && ffmpeg -version | head -1
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: cargo test --release --test hardening reference_decoders_agree -- --ignored --nocapture
+
+  # A build for x86 processors with AVX2 takes other paths than the baseline build: the
+  # decoder's fixed-size prediction loops check their products, and the compiler
+  # vectorizes more and wider. The same tests, damaged streams, random encoder input
+  # and reference decoders have to pass there.
+  x86-64-v3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: the runner has AVX2, BMI2 and FMA
+        run: grep -m1 -w avx2 /proc/cpuinfo | grep -w bmi2 | grep -qw fma
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends flac ffmpeg
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --release --features rayon
+      - run: cargo test --release --test hardening reference_decoders_agree -- --ignored --nocapture
+      - name: damaged streams and random encoder input, with overflow checks and debug assertions
+        env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+          HARDENING_ROUNDS: "1000000"
+          ENCODER_ROUNDS: "20000"
+        run: cargo test --release --test hardening
 
   deny:
     runs-on: ubuntu-24.04
