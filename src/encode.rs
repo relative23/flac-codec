@@ -259,7 +259,9 @@ impl<W: std::io::Write + std::io::Seek, E: crate::byteorder::Endianness> FlacByt
                 E::bytes_to_le(buf, self.bytes_per_sample);
 
                 // update MD5 sum with little-endian bytes
-                self.encoder.md5.consume(&buf);
+                if !self.encoder.hashes_frames() {
+                    self.encoder.md5.consume(&buf);
+                }
 
                 self.encoder
                     .encode(self.frame.fill_from_buf::<LittleEndian>(buf))?;
@@ -375,7 +377,9 @@ impl<W: std::io::Write + std::io::Seek, E: crate::byteorder::Endianness> std::io
             E::bytes_to_le(buf, self.bytes_per_sample);
 
             // update MD5 sum with little-endian bytes
-            self.encoder.md5.consume(&buf);
+            if !self.encoder.hashes_frames() {
+                self.encoder.md5.consume(&buf);
+            }
 
             // encode fresh FLAC frame
             self.encoder
@@ -571,11 +575,13 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
             }
             // update running MD5 sum calculation
             // since samples are already interleaved in channel order
-            update_md5(
-                &mut self.encoder.md5,
-                self.sample_buf.iter().copied(),
-                self.bytes_per_sample,
-            );
+            if !self.encoder.hashes_frames() {
+                update_md5(
+                    &mut self.encoder.md5,
+                    self.sample_buf.iter().copied(),
+                    self.bytes_per_sample,
+                );
+            }
             self.encoder
                 .encode(self.frame.fill_from_samples(&self.sample_buf))?;
             self.sample_buf.clear();
@@ -583,11 +589,13 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
 
         let mut frames = samples.chunks_exact(self.frame_sample_size);
         for buf in &mut frames {
-            update_md5(
-                &mut self.encoder.md5,
-                buf.iter().copied(),
-                self.bytes_per_sample,
-            );
+            if !self.encoder.hashes_frames() {
+                update_md5(
+                    &mut self.encoder.md5,
+                    buf.iter().copied(),
+                    self.bytes_per_sample,
+                );
+            }
 
             // encode fresh FLAC frame
             self.encoder.encode(self.frame.fill_from_samples(buf))?;
@@ -608,11 +616,13 @@ impl<W: std::io::Write + std::io::Seek> FlacSampleWriter<W> {
 
                 // update running MD5 sum calculation
                 // since samples are already interleaved in channel order
-                update_md5(
-                    &mut self.encoder.md5,
-                    buf.iter().copied(),
-                    self.bytes_per_sample,
-                );
+                if !self.encoder.hashes_frames() {
+                    update_md5(
+                        &mut self.encoder.md5,
+                        buf.iter().copied(),
+                        self.bytes_per_sample,
+                    );
+                }
 
                 // encode final FLAC frame
                 self.encoder.encode(self.frame.fill_from_samples(buf))?;
@@ -887,14 +897,16 @@ impl<W: std::io::Write + std::io::Seek> FlacChannelWriter<W> {
             .collect::<MultiZip<_>>()
         {
             // update running MD5 sum calculation
-            update_md5(
-                &mut self.encoder.md5,
-                bufs.iter()
-                    .map(|c| c.iter().copied())
-                    .collect::<MultiZip<_>>()
-                    .flatten(),
-                self.bytes_per_sample,
-            );
+            if !self.encoder.hashes_frames() {
+                update_md5(
+                    &mut self.encoder.md5,
+                    bufs.iter()
+                        .map(|c| c.iter().copied())
+                        .collect::<MultiZip<_>>()
+                        .flatten(),
+                    self.bytes_per_sample,
+                );
+            }
 
             // encode fresh FLAC frame
             self.encoder.encode(self.frame.fill_from_channels(&bufs))?;
@@ -917,15 +929,17 @@ impl<W: std::io::Write + std::io::Seek> FlacChannelWriter<W> {
             // encode as many samples possible into final frame, if necessary
             if !self.channel_bufs[0].is_empty() {
                 // update running MD5 sum calculation
-                update_md5(
-                    &mut self.encoder.md5,
-                    self.channel_bufs
-                        .iter()
-                        .map(|c| c.iter().copied())
-                        .collect::<MultiZip<_>>()
-                        .flatten(),
-                    self.bytes_per_sample,
-                );
+                if !self.encoder.hashes_frames() {
+                    update_md5(
+                        &mut self.encoder.md5,
+                        self.channel_bufs
+                            .iter()
+                            .map(|c| c.iter().copied())
+                            .collect::<MultiZip<_>>()
+                            .flatten(),
+                        self.bytes_per_sample,
+                    );
+                }
 
                 // encode final FLAC frame
                 self.encoder.encode(
@@ -1444,7 +1458,8 @@ impl Options {
     /// frames are collected and encoded together, so an error in a frame
     /// is returned when its group is encoded, by a later write or by
     /// finalizing, rather than by the write that completed the frame.
-    /// Up to four frames per thread are held in memory.
+    /// Up to four frames per thread are held in memory, and one more thread
+    /// computes the MD5 of the samples.
     pub fn threads(self, threads: NonZero<usize>) -> Self {
         Self { threads, ..self }
     }
@@ -2046,6 +2061,13 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
         )
     }
 
+    /// Whether the encoder hashes every frame's samples itself. It does when
+    /// it encodes queued frames on several threads, on a thread of its own next
+    /// to them; otherwise the writer hashes them before it hands them over.
+    fn hashes_frames(&self) -> bool {
+        self.queue.threads.get() > 1
+    }
+
     /// Queues a frame to be encoded with others on several threads;
     /// the same as `encode` once the queue is flushed.
     ///
@@ -2115,7 +2137,14 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
         let per_thread = encodable.div_ceil(threads);
         let (options, streaminfo, sample_rate) =
             (&self.options, self.blocks.streaminfo(), self.sample_rate);
+        let (md5, hashed) = (&mut self.md5, &queue.frames[..count]);
         let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
+            // the MD5 of the samples, in order, next to the encoding
+            let hashing = scope.spawn(move || {
+                for frame in hashed {
+                    update_md5(md5, frame.iter(), frame.bytes_per_sample());
+                }
+            });
             let jobs: Vec<_> = queue.frames[..encodable]
                 .chunks(per_thread)
                 .zip(queue.encoded[..encodable].chunks_mut(per_thread))
@@ -2142,9 +2171,12 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
                     })
                 })
                 .collect();
-            jobs.into_iter()
+            let results = jobs
+                .into_iter()
                 .flat_map(|job| job.join().expect("encoding thread panicked"))
-                .collect()
+                .collect();
+            hashing.join().expect("hashing thread panicked");
+            results
         });
 
         // write them in order, with what `encode` does around each frame
