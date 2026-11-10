@@ -26,8 +26,6 @@ trait SignedInteger:
     bitstream_io::SignedInteger + Into<i64> + std::ops::AddAssign + std::ops::Neg<Output = Self>
 {
     fn from_i64(i: i64) -> Self;
-
-    fn from_u32(u: u32) -> Self;
 }
 
 impl SignedInteger for i32 {
@@ -35,22 +33,12 @@ impl SignedInteger for i32 {
     fn from_i64(i: i64) -> i32 {
         i as i32
     }
-
-    #[inline(always)]
-    fn from_u32(u: u32) -> i32 {
-        u as i32
-    }
 }
 
 impl SignedInteger for i64 {
     #[inline(always)]
     fn from_i64(i: i64) -> i64 {
         i
-    }
-
-    #[inline(always)]
-    fn from_u32(u: u32) -> i64 {
-        u as i64
     }
 }
 
@@ -2440,6 +2428,27 @@ trait ReadRice: BitRead {
         let lsb = self.read_counted::<RICE_MAX, u32>(rice)?;
         Ok((msb << u32::from(rice)) | lsb)
     }
+
+    /// Fills `partition` with the residuals of Rice parameter `rice`
+    #[inline]
+    fn read_rice_partition<const RICE_MAX: u32, I: SignedInteger>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+        partition: &mut [I],
+    ) -> std::io::Result<()> {
+        partition.iter_mut().try_for_each(|residual| {
+            *residual = unfold(self.read_rice::<RICE_MAX>(rice)?);
+            Ok(())
+        })
+    }
+}
+
+/// A residual from its zigzag-folded form: half the value, with every bit
+/// flipped where it was odd (0, 1, 2, 3, … are 0, -1, 1, -2, …)
+#[inline]
+fn unfold<I: SignedInteger>(folded: u32) -> I {
+    let residual = (folded >> 1) as i32 ^ -((folded & 1) as i32);
+    I::from_i64(residual.into())
 }
 
 impl<R: std::io::Read, E: bitstream_io::Endianness> ReadRice for bitstream_io::BitReader<R, E> {}
@@ -2452,6 +2461,15 @@ impl ReadRice for crate::frames::SliceBitReader<'_> {
     ) -> std::io::Result<u32> {
         self.rice(u32::from(rice))
     }
+
+    #[inline]
+    fn read_rice_partition<const RICE_MAX: u32, I: SignedInteger>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+        partition: &mut [I],
+    ) -> std::io::Result<()> {
+        self.rice_run(u32::from(rice), partition, unfold)
+    }
 }
 
 impl<T: ReadRice + ?Sized> ReadRice for &mut T {
@@ -2461,6 +2479,15 @@ impl<T: ReadRice + ?Sized> ReadRice for &mut T {
         rice: bitstream_io::BitCount<RICE_MAX>,
     ) -> std::io::Result<u32> {
         (**self).read_rice(rice)
+    }
+
+    #[inline]
+    fn read_rice_partition<const RICE_MAX: u32, I: SignedInteger>(
+        &mut self,
+        rice: bitstream_io::BitCount<RICE_MAX>,
+        partition: &mut [I],
+    ) -> std::io::Result<()> {
+        (**self).read_rice_partition(rice, partition)
     }
 }
 
@@ -2493,15 +2520,7 @@ fn read_residuals<R: ReadRice, I: SignedInteger>(
         for partition in partitions {
             match reader.parse()? {
                 ResidualPartitionHeader::Standard { rice } => {
-                    partition.iter_mut().try_for_each(|s| {
-                        let unsigned = reader.read_rice::<RICE_MAX>(rice)?;
-                        *s = if (unsigned & 1) == 1 {
-                            -(I::from_u32(unsigned >> 1)) - I::ONE
-                        } else {
-                            I::from_u32(unsigned >> 1)
-                        };
-                        Ok::<(), std::io::Error>(())
-                    })?;
+                    reader.read_rice_partition::<RICE_MAX, I>(rice, partition)?;
                 }
                 ResidualPartitionHeader::Escaped { escape_size } => {
                     partition.iter_mut().try_for_each(|s| {

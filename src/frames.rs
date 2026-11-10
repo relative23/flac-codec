@@ -293,6 +293,73 @@ impl SliceBitReader<'_> {
         };
         Ok((msb << k) | lsb)
     }
+
+    /// Fills `values` with Rice-coded values of parameter `k` (at most 30),
+    /// each passed through `unfold`: the same values, the same error and the
+    /// same position afterwards as calling [`Self::rice`] for each of them
+    ///
+    /// Reading one code at a time keeps the reader's state in memory between
+    /// the calls, and every code waits for the state the previous one
+    /// stored. Here the state stays in local values for the whole run, and a
+    /// code is taken apart with one count and one shift. What that does not
+    /// cover is left to `rice`: a code that is longer than the cached bits,
+    /// and the last bytes of the slice.
+    pub(crate) fn rice_run<T>(
+        &mut self,
+        k: u32,
+        values: &mut [T],
+        unfold: impl Fn(u32) -> T,
+    ) -> io::Result<()> {
+        // below this many cached bits, more bytes are loaded
+        const REFILL: u32 = 32;
+        debug_assert!(k <= 30);
+
+        let low_bits = (1u64 << k) - 1;
+        // Unlike in the fields, bits may be set below the counted ones
+        // here. They are the stream's next bits, loaded early: a refill
+        // loads eight bytes and counts the whole bytes that fit, and the
+        // next one loads the rest again, to the same places.
+        let (mut cache, mut bits, mut pos) = (self.cache, self.bits, self.pos);
+        for value in values.iter_mut() {
+            if bits < REFILL
+                && let Some(bytes) = self
+                    .data
+                    .get(pos..)
+                    .and_then(|rest| rest.first_chunk::<8>())
+            {
+                cache |= u64::from_be_bytes(*bytes) >> bits;
+                pos += ((63 - bits) / 8) as usize;
+                // from 56 to 63: what was counted and the whole bytes added
+                bits |= 56;
+            }
+
+            let zeros = cache.leading_zeros();
+            // the zeros, the one that ends them and the low bits
+            let length = zeros + 1 + k;
+            if length <= bits.min(63) {
+                let low = (cache >> (64 - length)) & low_bits;
+                cache <<= length;
+                bits -= length;
+                *value = unfold((zeros << k) | low as u32);
+            } else {
+                // `rice` reads this one, from the state as the fields hold it
+                (self.cache, self.bits, self.pos) = (counted(cache, bits), bits, pos);
+                *value = unfold(self.rice(k)?);
+                (cache, bits, pos) = (self.cache, self.bits, self.pos);
+            }
+        }
+        (self.cache, self.bits, self.pos) = (counted(cache, bits), bits, pos);
+        Ok(())
+    }
+}
+
+/// The top `bits` bits of `cache`, with nothing below them
+#[inline]
+fn counted(cache: u64, bits: u32) -> u64 {
+    match bits {
+        0 => 0,
+        bits => cache & (u64::MAX << (64 - bits)),
+    }
 }
 
 /// An unsigned value of up to 64 bits in a type at least that wide
@@ -812,6 +879,101 @@ mod test {
                 );
             }
         }
+    }
+
+    /// Runs of Rice codes against the same codes read one at a time, from
+    /// any position in a byte: written codes of every length (also longer
+    /// than the cache holds), and arbitrary bytes that run out in the middle.
+    /// The values, the error, the position and whatever is read afterwards
+    /// must be the same.
+    #[test]
+    fn rice_runs_read_like_single_codes() {
+        use super::FrameWriter;
+        use bitstream_io::BitWrite;
+
+        let mut rng = Rng(0x0BAD_5EED_CAFE);
+        let (mut long_codes, mut ran_out) = (0, 0);
+        for round in 0..30000 {
+            let k = rng.below(31) as u32;
+            let skipped = rng.below(70) as u32;
+            let mut data = vec![];
+            let count = match rng.below(3) {
+                // arbitrary bytes, often zeros (long counts) or ones
+                0 => {
+                    data.extend((0..rng.below(80)).map(|_| match rng.below(4) {
+                        0 => 0x00,
+                        1 => 0xFF,
+                        _ => rng.next() as u8,
+                    }));
+                    rng.below(60) as usize
+                }
+                // written codes after some other bits, and a few bytes
+                // behind them or none
+                _ => {
+                    let count = rng.below(400) as usize;
+                    let mut writer = FrameWriter::new(&mut data);
+                    writer.write_var::<u64>(skipped.min(64), 0).unwrap();
+                    writer
+                        .write_var::<u64>(skipped - skipped.min(64), 0)
+                        .unwrap();
+                    for _ in 0..count {
+                        // short counts as audio has them, and counts up to
+                        // more than two refills of the cache
+                        let msb = match rng.below(40) {
+                            0 => rng.below(200) as u32,
+                            1 => 50 + rng.below(20) as u32,
+                            _ => rng.below(6) as u32,
+                        };
+                        long_codes += usize::from(msb + 1 + k > 56);
+                        writer.rice(k, (msb << k) | (rng.next() as u32 & ((1 << k) - 1)));
+                    }
+                    writer.byte_align().unwrap();
+                    writer.finish();
+                    data.extend((0..rng.below(3) * 5).map(|_| rng.next() as u8));
+                    count
+                }
+            };
+            let context = format!("round {round}, k {k}, {count} codes after {skipped} bits");
+
+            let mut single = SliceBitReader::new(&data);
+            let mut run = SliceBitReader::new(&data);
+            if single.skip(skipped).is_err() {
+                continue;
+            }
+            run.skip(skipped).unwrap();
+
+            let one_by_one: std::io::Result<Vec<u32>> =
+                (0..count).map(|_| single.rice(k)).collect();
+            let mut values = vec![u32::MAX; count];
+            let together = run.rice_run(k, &mut values, |folded| folded);
+            match (&one_by_one, &together) {
+                (Ok(expected), Ok(())) => assert_eq!(&values, expected, "{context}"),
+                (Err(a), Err(b)) => {
+                    ran_out += 1;
+                    assert_eq!(a.kind(), b.kind(), "{context}");
+                }
+                _ => panic!("{context}: {one_by_one:?} against {together:?}"),
+            }
+            assert_eq!(run.consumed(), single.consumed(), "{context}: position");
+            assert_eq!(run.ran_out(), single.ran_out(), "{context}");
+            // the same bit of the same byte is next (how many bytes are
+            // cached ahead may differ), and nothing is set below the cached bits
+            assert_eq!(run.bits % 8, single.bits % 8, "{context}: bit position");
+            assert_eq!(
+                run.cache,
+                super::counted(run.cache, run.bits),
+                "{context}: cache"
+            );
+            for n in [1, 7, 33, 64] {
+                let (a, b) = (single.take_wide(n), run.take_wide(n));
+                assert_eq!(a.ok(), b.ok(), "{context}: {n} bits afterwards");
+            }
+        }
+        // both the codes left to `rice` and the ends of the bytes were met
+        assert!(
+            long_codes > 1000 && ran_out > 1000,
+            "{long_codes}, {ran_out}"
+        );
     }
 
     /// The same random operations on bitstream-io's writer and on ours:
