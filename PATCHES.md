@@ -21,7 +21,7 @@ pull request.
 | `ebfd19b` | Allow LPC order 32 in debug builds (a debug assertion rejected the highest order the options accept) | `fix-lpc-order-32-debug-assertion` | not in #4: issue tuffy/flac-codec#9, PR tuffy/flac-codec#10 (open) |
 | `4474e6b` | Write a residual of i32::MIN without overflowing (debug builds; found by the `roundtrip` fuzz target) | `fix-residual-min-negation` | also fixed in #4 |
 | `f57ffea` | Write STREAMINFO's bit depth without unwrapping (a damaged STREAMINFO with 1 bit per sample panicked when written back, release builds too; found by the `metadata` fuzz target) | `fix-streaminfo-low-bit-depth-write` | also fixed in #4, with the same line |
-| `711ca41` | Finalize sample and channel writers when they are dropped (`FlacSampleWriter` and `FlacChannelWriter` lost their last, partly filled block without an error; found by the thread tests) | `fix-writers-finalize-on-drop` | not in #4; not reported yet |
+| `711ca41` | Finalize sample and channel writers when they are dropped (`FlacSampleWriter` and `FlacChannelWriter` lost their last, partly filled block without an error; found by the thread tests) | `fix-writers-finalize-on-drop` | not in #4: issue tuffy/flac-codec#11, PR tuffy/flac-codec#12 (open) |
 
 ## Speed
 
