@@ -122,20 +122,6 @@ impl Md5 {
     }
 }
 
-/// So that `std::io::copy` can sum what a reader gives
-impl std::io::Write for Md5 {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.update(bytes);
-        Ok(bytes.len())
-    }
-
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Mixes one block into `state`
 ///
 /// A step replaces the oldest of the four words: the word, a message word,
@@ -309,13 +295,5 @@ mod tests {
             assert_eq!(md5.finalize(), expected, "round {round}, {len} bytes");
             assert_eq!(copy.finalize(), expected, "round {round}, {len} bytes");
         }
-    }
-
-    #[test]
-    fn copying_from_a_reader_sums_its_bytes() {
-        let bytes: Vec<u8> = (0..100_000u32).map(|i| ((i * 31) >> 3) as u8).collect();
-        let mut md5 = Md5::default();
-        std::io::copy(&mut bytes.as_slice(), &mut md5).unwrap();
-        assert_eq!(md5.finalize(), ::md5::compute(&bytes).0);
     }
 }
