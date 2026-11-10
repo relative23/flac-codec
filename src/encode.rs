@@ -4588,15 +4588,14 @@ fn partitions_bits<const RICE_MAX: u32>(partitions: &[Partition<'_, RICE_MAX>]) 
                 let rice = u32::from(*rice);
                 Some(
                     parameter
+                        + residuals.len() as u64 * (1 + u64::from(rice))
                         + residuals
                             .iter()
                             .map(|s| {
-                                let folded = if s.is_negative() {
-                                    ((s.unsigned_abs() - 1) << 1) + 1
-                                } else {
-                                    (*s as u32) << 1
-                                };
-                                u64::from(folded >> rice) + 1 + u64::from(rice)
+                                // zigzag folding without a branch: twice the value,
+                                // with every bit flipped when it is negative
+                                let folded = ((*s << 1) ^ (*s >> 31)) as u32;
+                                u64::from(folded >> rice)
                             })
                             .sum::<u64>(),
                 )
