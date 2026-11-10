@@ -1849,6 +1849,16 @@ struct LpcCache {
     window: Vec<f64>,
     windowed: Vec<f64>,
     residuals: Vec<i32>,
+    scratch: ResidualScratch,
+}
+
+/// Working space for `float_residuals`
+#[derive(Default)]
+struct ResidualScratch {
+    // the channel's samples
+    samples: Vec<f64>,
+    // each sample's prediction, before the shift
+    predictions: Vec<f64>,
 }
 
 /// A FLAC encoder
@@ -3510,6 +3520,7 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
             residuals,
             window,
             windowed,
+            scratch,
         }: &'r mut LpcCache,
         channel: &'w [i32],
     ) -> Result<Self, Error> {
@@ -3522,7 +3533,7 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
             channel,
         )?;
 
-        Self::encode_residuals(&parameters, channel, residuals)
+        Self::encode_residuals(&parameters, channel, scratch, residuals)
             .map(|(warm_up, residuals)| Self {
                 warm_up,
                 residuals,
@@ -3534,88 +3545,214 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
     fn encode_residuals(
         parameters: &LpcParameters,
         channel: &'w [i32],
+        scratch: &mut ResidualScratch,
         residuals: &'r mut Vec<i32>,
     ) -> Result<(&'w [i32], &'r [i32]), ResidualOverflow> {
-        residuals.clear();
+        let order = usize::from(parameters.order.get());
+        let (warm_up, predicted) = channel.split_at(order);
 
-        // fixed-size loops for the usual orders, which the compiler unrolls
-        // and vectorizes; the same arithmetic as the general loop below
-        macro_rules! orders {
-            ($($n:literal)*) => {
-                match parameters.coefficients.len() {
-                    $($n => {
-                        if let Ok(coefficients) =
-                            <&[i32; $n]>::try_from(parameters.coefficients.as_slice())
-                        {
-                            lpc_residuals(coefficients, parameters.shift, channel, residuals)?;
-                            return Ok((&channel[0..$n], residuals.as_slice()));
-                        }
-                    })*
-                    _ => {}
+        // (every residual is assigned below, so a buffer that already has
+        // the block's length is left as it is)
+        residuals.resize(predicted.len(), 0);
+
+        match float_residuals(
+            &parameters.coefficients,
+            parameters.shift,
+            channel,
+            scratch,
+            residuals,
+        ) {
+            Some(result) => result?,
+            // the same in 64-bit integers, for coefficients too large for the above
+            None => {
+                for (split, residual) in (order..channel.len()).zip(residuals.iter_mut()) {
+                    let (previous, current) = channel.split_at(split);
+
+                    *residual = current[0]
+                        .checked_sub(
+                            (previous
+                                .iter()
+                                .rev()
+                                .zip(&parameters.coefficients)
+                                .map(|(x, y)| *x as i64 * *y as i64)
+                                .sum::<i64>()
+                                >> parameters.shift) as i32,
+                        )
+                        .ok_or(ResidualOverflow)?;
                 }
-            };
-        }
-        if usize::from(parameters.order.get()) == parameters.coefficients.len() {
-            orders!(1 2 3 4 5 6 7 8 9 10 11 12);
+            }
         }
 
-        for split in usize::from(parameters.order.get())..channel.len() {
-            let (previous, current) = channel.split_at(split);
+        Ok((warm_up, residuals.as_slice()))
+    }
+}
 
-            residuals.push(
+/// LPC residuals, each sample less its prediction, from sums computed
+/// exactly in floating point; an error if a residual does not fit in 32 bits
+///
+/// A sample has at most 32 bits, so while the coefficients' magnitudes add up
+/// to less than 2^20 (they always do at up to 15 bits of precision and order
+/// 32), every product of a sample and a coefficient and every sum of such
+/// products is an integer below 2^51, which `f64` holds exactly: the result
+/// is that of 64-bit integer arithmetic, in any order of summation. Unlike
+/// 64-bit integer multiplication, these loops vectorize.
+///
+/// Fills `residuals`, which is one residual for each sample of `channel`
+/// after its first `coefficients.len()`. Returns `None`, with nothing done,
+/// for coefficients beyond that bound or `residuals` of another length.
+fn float_residuals(
+    coefficients: &[i32],
+    shift: u32,
+    channel: &[i32],
+    ResidualScratch {
+        samples,
+        predictions,
+    }: &mut ResidualScratch,
+    residuals: &mut [i32],
+) -> Option<Result<(), ResidualOverflow>> {
+    // below this sum of the coefficients' magnitudes, every sum is an integer
+    // of magnitude below 2^51
+    const EXACT: u64 = 1 << 20;
+    // how many predictions are summed side by side, in local values
+    const LANES: usize = 8;
+
+    let order = coefficients.len();
+    let magnitudes = coefficients
+        .iter()
+        .map(|c| u64::from(c.unsigned_abs()))
+        .sum::<u64>();
+    let count = residuals.len();
+    if order == 0 || magnitudes >= EXACT || channel.len() != order + count {
+        return None;
+    }
+
+    samples.clear();
+    samples.extend(channel.iter().map(|sample| f64::from(*sample)));
+    let coefficients: ArrayVec<f64, MAX_LPC_COEFFS> = coefficients
+        .iter()
+        .take(MAX_LPC_COEFFS)
+        .map(|coefficient| f64::from(*coefficient))
+        .collect();
+    if coefficients.len() != order {
+        return None;
+    }
+
+    // (every prediction is assigned below)
+    predictions.resize(count, 0.0);
+
+    // groups of LANES predictions: each group needs the `order` samples
+    // before its first prediction and the samples up to its last one
+    let (groups, rest) = predictions.as_chunks_mut::<LANES>();
+    for (group, window) in groups
+        .iter_mut()
+        .zip(samples.windows(order - 1 + LANES).step_by(LANES))
+    {
+        let mut sums = [0.0; LANES];
+        for (k, coefficient) in coefficients.iter().enumerate() {
+            // the samples `k + 1` before the predicted ones
+            let past = &window[order - 1 - k..order - 1 - k + LANES];
+            for (sum, sample) in sums.iter_mut().zip(past) {
+                *sum += coefficient * sample;
+            }
+        }
+        *group = sums;
+    }
+    // the predictions left over, one at a time
+    let first = count - rest.len();
+    for (i, prediction) in rest.iter_mut().enumerate() {
+        *prediction = samples[first + i..first + i + order]
+            .iter()
+            .rev()
+            .zip(&coefficients)
+            .map(|(sample, coefficient)| coefficient * sample)
+            .sum();
+    }
+
+    // As `i32::checked_sub` in the integer loop, but without stopping: a
+    // difference overflows where the signs of the two differ and the result
+    // has the sign of `prediction`, which sets the sign bit of `overflow`.
+    // The flag is the fold's own value, so that it stays in a register.
+    let overflow = residuals
+        .iter_mut()
+        .zip(predictions.iter())
+        .zip(&channel[order..])
+        .fold(0, |overflow, ((residual, sum), sample)| {
+            let prediction = (exact_integer(*sum) >> shift) as i32;
+            *residual = sample.wrapping_sub(prediction);
+            overflow | (sample ^ prediction) & (sample ^ *residual)
+        });
+    Some(match overflow < 0 {
+        false => Ok(()),
+        true => Err(ResidualOverflow),
+    })
+}
+
+/// An integer of magnitude below 2^51 that is held in a `f64`, as an `i64`
+///
+/// Adding 1.5 × 2^52 moves the value into the range from 2^52 to 2^53, where
+/// the bits of a `f64` below its exponent are the number itself less 2^52.
+/// The difference of the two bit patterns is therefore the integer. This
+/// takes an addition and a subtraction and vectorizes, where the ordinary
+/// conversion checks for values that cannot occur here and does not.
+#[inline]
+fn exact_integer(value: f64) -> i64 {
+    const OFFSET: f64 = 6_755_399_441_055_744.0;
+
+    debug_assert!(value.abs() < 2_251_799_813_685_248.0 && value.fract() == 0.0);
+    ((value + OFFSET).to_bits() as i64).wrapping_sub(OFFSET.to_bits() as i64)
+}
+
+#[test]
+fn exact_integer_is_the_integer() {
+    assert_eq!(1.5 * 2f64.powi(52), 6_755_399_441_055_744.0);
+    let limit = (1i64 << 51) - 1;
+    for value in [
+        0,
+        1,
+        -1,
+        2,
+        -2,
+        255,
+        -256,
+        limit,
+        -limit,
+        limit - 1,
+        1 - limit,
+    ] {
+        assert_eq!(exact_integer(value as f64), value);
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..100_000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let value = (seed as i64) >> (13 + seed % 51);
+        assert_eq!(exact_integer(value as f64), value);
+    }
+}
+
+#[test]
+fn float_residuals_match_the_integer_loop() {
+    // the integer loop of `encode_residuals`
+    fn integers(coefficients: &[i32], shift: u32, channel: &[i32]) -> Result<Vec<i32>, ()> {
+        (coefficients.len()..channel.len())
+            .map(|split| {
+                let (previous, current) = channel.split_at(split);
                 current[0]
                     .checked_sub(
                         (previous
                             .iter()
                             .rev()
-                            .zip(&parameters.coefficients)
+                            .zip(coefficients)
                             .map(|(x, y)| *x as i64 * *y as i64)
                             .sum::<i64>()
-                            >> parameters.shift) as i32,
+                            >> shift) as i32,
                     )
-                    .ok_or(ResidualOverflow)?,
-            );
-        }
-
-        Ok((
-            &channel[0..parameters.order.get().into()],
-            residuals.as_slice(),
-        ))
+                    .ok_or(())
+            })
+            .collect()
     }
-}
 
-/// LPC residuals for exactly `N` coefficients: each sample less its
-/// prediction, an error if one does not fit in 32 bits
-#[inline]
-fn lpc_residuals<const N: usize>(
-    coefficients: &[i32; N],
-    shift: u32,
-    channel: &[i32],
-    residuals: &mut Vec<i32>,
-) -> Result<(), ResidualOverflow> {
-    let mut overflow = false;
-    residuals.extend(channel.windows(N + 1).map(|window| {
-        let (history, current) = window.split_at(N);
-        let prediction = history
-            .iter()
-            .rev()
-            .zip(coefficients)
-            .map(|(x, y)| i64::from(*x) * i64::from(*y))
-            .sum::<i64>()
-            >> shift;
-        // as `i32::checked_sub` in the general loop, but without stopping
-        let residual = i64::from(current[0]) - i64::from(prediction as i32);
-        overflow |= residual != i64::from(residual as i32);
-        residual as i32
-    }));
-    match overflow {
-        false => Ok(()),
-        true => Err(ResidualOverflow),
-    }
-}
-
-#[test]
-fn lpc_residuals_by_order_match_the_general_loop() {
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut next = || {
         seed ^= seed << 13;
@@ -3623,48 +3760,69 @@ fn lpc_residuals_by_order_match_the_general_loop() {
         seed ^= seed << 17;
         seed
     };
-    for order in 1..=12usize {
-        for round in 0..60 {
-            // large samples and coefficients, so that some residuals overflow
-            let bits = [8, 16, 24, 31][round % 4];
-            let coefficients: Vec<i32> = (0..order).map(|_| (next() as i16 >> 1).into()).collect();
-            let shift = (next() % 16) as u32;
-            let channel: Vec<i32> = (0..200).map(|_| (next() as i32) >> (32 - bits)).collect();
+    let mut scratch = ResidualScratch::default();
+    let mut residuals = vec![];
+    let mut overflows = 0;
+    for round in 0..3000 {
+        let order = 1 + (next() % 32) as usize;
+        // coefficients of up to 15 bits, as quantizing gives, and full-scale
+        // samples of 4 to 32 bits, the edges of the range included
+        let precision = 2 + (next() % 14) as u32;
+        let coefficients: Vec<i32> = (0..order)
+            .map(|_| match next() % 8 {
+                0 => (1 << (precision - 1)) - 1,
+                1 => -(1 << (precision - 1)),
+                _ => (next() as i32) >> (32 - precision),
+            })
+            .collect();
+        let shift = (next() % 16) as u32;
+        let bits = 4 + (next() % 29) as u32;
+        // lengths below the order, around the block size and of whole blocks
+        let len = match round % 5 {
+            0 => (next() % 40) as usize,
+            1 => 1024 + order - 2 + (next() % 4) as usize,
+            2 => 4096,
+            _ => (next() % 3000) as usize,
+        };
+        let channel: Vec<i32> = (0..len)
+            .map(|_| match next() % 16 {
+                0 => i32::MAX >> (32 - bits),
+                1 => i32::MIN >> (32 - bits),
+                _ => (next() as i32) >> (32 - bits),
+            })
+            .collect();
 
-            let general: Result<Vec<i32>, ()> = (order..channel.len())
-                .map(|split| {
-                    let (previous, current) = channel.split_at(split);
-                    current[0]
-                        .checked_sub(
-                            (previous
-                                .iter()
-                                .rev()
-                                .zip(&coefficients)
-                                .map(|(x, y)| *x as i64 * *y as i64)
-                                .sum::<i64>()
-                                >> shift) as i32,
-                        )
-                        .ok_or(())
-                })
-                .collect();
-
-            let parameters = LpcParameters {
-                order: NonZero::new(order as u8).unwrap(),
-                precision: SignedBitCount::new::<15>(),
-                shift,
-                coefficients: coefficients.iter().copied().collect(),
-            };
-            let mut residuals = vec![];
-            let fast =
-                LpcSubframeParameters::encode_residuals(&parameters, &channel, &mut residuals)
-                    .map(|(warm_up, residuals)| {
-                        assert_eq!(warm_up, &channel[..order]);
-                        residuals.to_vec()
-                    })
-                    .map_err(|ResidualOverflow| ());
-            assert_eq!(fast, general, "order {order}, {bits} bits");
+        // (whatever an earlier round left in the buffer is overwritten)
+        residuals.resize(len.saturating_sub(order), 0);
+        let floats = float_residuals(&coefficients, shift, &channel, &mut scratch, &mut residuals);
+        if len < order {
+            // not even the samples to predict from
+            assert!(floats.is_none(), "round {round}");
+            continue;
         }
+        let floats = floats
+            .expect("coefficients within the exact bound")
+            .map(|()| residuals.clone())
+            .map_err(|ResidualOverflow| ());
+        let expected = integers(&coefficients, shift, &channel);
+        overflows += usize::from(expected.is_err());
+        assert_eq!(
+            floats, expected,
+            "round {round}: order {order}, {bits} bits, {len} samples"
+        );
     }
+    // some rounds do overflow, so that case is compared too
+    assert!(overflows > 0);
+
+    // coefficients beyond the bound are left to the integer loop
+    let channel = [1, 2, 3];
+    let mut two = [0; 2];
+    assert!(float_residuals(&[1 << 20], 0, &channel, &mut scratch, &mut two).is_none());
+    assert!(float_residuals(&[(1 << 20) - 1], 0, &channel, &mut scratch, &mut two).is_some());
+    // and so is anything but one residual for each predicted sample
+    assert!(float_residuals(&[], 0, &channel, &mut scratch, &mut [0; 3]).is_none());
+    assert!(float_residuals(&[1], 0, &channel, &mut scratch, &mut [0; 3]).is_none());
+    assert!(float_residuals(&[1], 0, &channel, &mut scratch, &mut [0; 1]).is_none());
 }
 
 #[derive(Debug)]
@@ -3698,6 +3856,7 @@ fn test_residual_encoding_1() {
             coefficients: arrayvec![59, -30],
         },
         &samples,
+        &mut ResidualScratch::default(),
         &mut actual_residuals,
     )
     .unwrap();
@@ -3727,6 +3886,7 @@ fn test_residual_encoding_2() {
             coefficients: arrayvec![58, -29],
         },
         &samples,
+        &mut ResidualScratch::default(),
         &mut actual_residuals,
     )
     .unwrap();
