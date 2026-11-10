@@ -51,6 +51,7 @@ mod crc;
 pub mod decode;
 pub mod encode;
 mod frames;
+mod md5;
 pub mod metadata;
 pub mod stream;
 

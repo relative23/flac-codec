@@ -10,6 +10,7 @@
 
 use crate::Error;
 use crate::audio::Frame;
+use crate::md5::Md5;
 use crate::metadata::{BlockList, ChannelMask, SeekTable};
 use bitstream_io::{BitRead, SignedBitCount};
 use std::collections::VecDeque;
@@ -1294,9 +1295,9 @@ pub fn verify_reader<R: std::io::Read>(r: R) -> Result<Verified, Error> {
     let mut r = FlacByteReader::endian(r, LittleEndian)?;
     match r.md5().cloned() {
         Some(flac_md5) => {
-            let mut output_md5 = md5::Context::new();
+            let mut output_md5 = Md5::default();
             std::io::copy(&mut r, &mut output_md5)?;
-            Ok(if flac_md5 == output_md5.finalize().0 {
+            Ok(if flac_md5 == output_md5.finalize() {
                 Verified::MD5Match
             } else {
                 Verified::MD5Mismatch

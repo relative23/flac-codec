@@ -17,6 +17,7 @@
 //! encode twice as fast.
 
 use crate::audio::Frame;
+use crate::md5::Md5;
 use crate::metadata::{
     Application, BlockList, BlockSize, Cuesheet, Picture, PortableMetadataBlock, SeekPoint,
     Streaminfo, VorbisComment, write_blocks,
@@ -260,7 +261,7 @@ impl<W: std::io::Write + std::io::Seek, E: crate::byteorder::Endianness> FlacByt
 
                 // update MD5 sum with little-endian bytes
                 if !self.encoder.hashes_frames() {
-                    self.encoder.md5.consume(&buf);
+                    self.encoder.md5.update(buf);
                 }
 
                 self.encoder
@@ -378,7 +379,7 @@ impl<W: std::io::Write + std::io::Seek, E: crate::byteorder::Endianness> std::io
 
             // update MD5 sum with little-endian bytes
             if !self.encoder.hashes_frames() {
-                self.encoder.md5.consume(&buf);
+                self.encoder.md5.update(buf);
             }
 
             // encode fresh FLAC frame
@@ -1229,13 +1230,13 @@ impl<W: std::io::Write> FlacStreamWriter<W> {
     }
 }
 
-fn update_md5(md5: &mut md5::Context, samples: impl Iterator<Item = i32>, bytes_per_sample: usize) {
+fn update_md5(md5: &mut Md5, samples: impl Iterator<Item = i32>, bytes_per_sample: usize) {
     use crate::byteorder::{Endianness, LittleEndian};
 
     // the samples' bytes go to the MD5 a buffer at a time, which gives the same
     // sum as one sample at a time; 3072 holds whole samples of 1 to 4 bytes
     fn consume<const N: usize>(
-        md5: &mut md5::Context,
+        md5: &mut Md5,
         samples: impl Iterator<Item = i32>,
         to_bytes: impl Fn(i32) -> [u8; N],
     ) {
@@ -1245,11 +1246,11 @@ fn update_md5(md5: &mut md5::Context, samples: impl Iterator<Item = i32>, bytes_
             buf[len..len + N].copy_from_slice(&to_bytes(sample));
             len += N;
             if len == buf.len() {
-                md5.consume(buf);
+                md5.update(&buf);
                 len = 0;
             }
         }
-        md5.consume(&buf[..len]);
+        md5.update(&buf[..len]);
     }
 
     match bytes_per_sample {
@@ -1270,20 +1271,20 @@ fn md5_by_buffers_matches_md5_by_samples() {
             let samples: Vec<i32> = (0..len as i32)
                 .map(|i| i.wrapping_mul(2_654_435_761u32 as i32))
                 .collect();
-            let mut by_buffers = md5::Context::new();
+            let mut by_buffers = Md5::default();
             update_md5(&mut by_buffers, samples.iter().copied(), bytes);
-            let mut by_samples = md5::Context::new();
+            let mut by_samples = Md5::default();
             for s in &samples {
                 match bytes {
-                    1 => by_samples.consume(LittleEndian::i8_to_bytes(*s as i8)),
-                    2 => by_samples.consume(LittleEndian::i16_to_bytes(*s as i16)),
-                    3 => by_samples.consume(LittleEndian::i24_to_bytes(*s)),
-                    _ => by_samples.consume(LittleEndian::i32_to_bytes(*s)),
+                    1 => by_samples.update(&LittleEndian::i8_to_bytes(*s as i8)),
+                    2 => by_samples.update(&LittleEndian::i16_to_bytes(*s as i16)),
+                    3 => by_samples.update(&LittleEndian::i24_to_bytes(*s)),
+                    _ => by_samples.update(&LittleEndian::i32_to_bytes(*s)),
                 }
             }
             assert_eq!(
-                by_buffers.finalize().0,
-                by_samples.finalize().0,
+                by_buffers.finalize(),
+                by_samples.finalize(),
                 "{bytes} bytes, {len}"
             );
         }
@@ -1882,7 +1883,7 @@ struct Encoder<W: std::io::Write + std::io::Seek> {
     // all seekpoints
     seekpoints: Vec<EncoderSeekPoint>,
     // our running MD5 calculation
-    md5: md5::Context,
+    md5: Md5,
     // whether the encoder has finalized the file
     finalized: Finalized,
     // frames waiting to be encoded together on several threads
@@ -2019,7 +2020,7 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
             frame_number: FrameNumber::default(),
             samples_written: 0,
             seekpoints: Vec::new(),
-            md5: md5::Context::new(),
+            md5: Md5::default(),
             finalized: Finalized::NotFinalized,
             queue: FrameQueue::new(options.threads),
         })
@@ -2287,7 +2288,7 @@ impl<W: std::io::Write + std::io::Seek> Encoder<W> {
             }
 
             // update STREAMINFO MD5 sum
-            self.blocks.streaminfo_mut().md5 = Some(self.md5.clone().finalize().0);
+            self.blocks.streaminfo_mut().md5 = Some(self.md5.clone().finalize());
 
             // rewrite metadata blocks, relative to the beginning
             // of the stream
