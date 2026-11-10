@@ -182,10 +182,13 @@ impl Checksum for Crc16 {
     }
 }
 
-/// Tables for computing CRC-16 eight bytes at a time ("slicing by 8"):
+/// How many bytes `Crc16::update_slice` takes in one step
+const SLICE: usize = 16;
+
+/// Tables for computing CRC-16 `SLICE` bytes at a time ("slicing by 16"):
 /// entry `k` of a byte is its checksum followed by `k` zero bytes
-const fn crc16_tables() -> [[u16; 256]; 8] {
-    let mut tables = [[0u16; 256]; 8];
+const fn crc16_tables() -> [[u16; 256]; SLICE] {
+    let mut tables = [[0u16; 256]; SLICE];
     let mut i = 0;
     while i < 256 {
         let mut crc = (i as u16) << 8;
@@ -202,7 +205,7 @@ const fn crc16_tables() -> [[u16; 256]; 8] {
         i += 1;
     }
     let mut k = 1;
-    while k < 8 {
+    while k < SLICE {
         let mut i = 0;
         while i < 256 {
             let previous = tables[k - 1][i];
@@ -214,25 +217,25 @@ const fn crc16_tables() -> [[u16; 256]; 8] {
     tables
 }
 
-static CRC16_TABLES: [[u16; 256]; 8] = crc16_tables();
+static CRC16_TABLES: [[u16; 256]; SLICE] = crc16_tables();
 
 impl Crc16 {
     /// The checksum after `bytes`, the same as updating byte by byte
     pub fn update_slice(self, bytes: &[u8]) -> Self {
-        let t = &CRC16_TABLES;
         let mut crc = self.0;
-        let (chunks, rest) = bytes.as_chunks::<8>();
-        for c in chunks {
-            let x0 = c[0] ^ (crc >> 8) as u8;
-            let x1 = c[1] ^ crc as u8;
-            crc = t[7][usize::from(x0)]
-                ^ t[6][usize::from(x1)]
-                ^ t[5][usize::from(c[2])]
-                ^ t[4][usize::from(c[3])]
-                ^ t[3][usize::from(c[4])]
-                ^ t[2][usize::from(c[5])]
-                ^ t[1][usize::from(c[6])]
-                ^ t[0][usize::from(c[7])];
+        let (slices, rest) = bytes.as_chunks::<SLICE>();
+        for slice in slices {
+            // Each byte's entry for the zero bytes that follow it in the
+            // slice. Only the first two bytes take in the checksum so far,
+            // so the others are looked up ahead of it and added last.
+            let (first, others) = slice.split_at(2);
+            let ahead = others
+                .iter()
+                .zip(CRC16_TABLES[..SLICE - 2].iter().rev())
+                .fold(0, |ahead, (byte, table)| ahead ^ table[usize::from(*byte)]);
+            crc = CRC16_TABLES[SLICE - 1][usize::from(first[0] ^ (crc >> 8) as u8)]
+                ^ CRC16_TABLES[SLICE - 2][usize::from(first[1] ^ crc as u8)]
+                ^ ahead;
         }
         rest.iter().fold(Self(crc), |crc, byte| crc.update(*byte))
     }
