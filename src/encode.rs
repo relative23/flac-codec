@@ -1238,20 +1238,24 @@ fn update_md5(md5: &mut Md5, samples: impl Iterator<Item = i32>, bytes_per_sampl
     // sum as one sample at a time; 3072 holds whole samples of 1 to 4 bytes
     fn consume<const N: usize>(
         md5: &mut Md5,
-        samples: impl Iterator<Item = i32>,
+        mut samples: impl Iterator<Item = i32>,
         to_bytes: impl Fn(i32) -> [u8; N],
     ) {
         let mut buf = [0u8; 3072];
-        let mut len = 0;
-        for sample in samples {
-            buf[len..len + N].copy_from_slice(&to_bytes(sample));
-            len += N;
-            if len == buf.len() {
-                md5.update(&buf);
-                len = 0;
+        let (places, _) = buf.as_chunks_mut::<N>();
+        loop {
+            // a buffer's worth of samples in one loop with nothing else in
+            // it; a place is asked for first, so no sample is taken in vain
+            let mut filled = 0;
+            for (place, sample) in places.iter_mut().zip(samples.by_ref()) {
+                *place = to_bytes(sample);
+                filled += 1;
+            }
+            md5.update(places[..filled].as_flattened());
+            if filled < places.len() {
+                break;
             }
         }
-        md5.update(&buf[..len]);
     }
 
     match bytes_per_sample {
@@ -1268,12 +1272,27 @@ fn md5_by_buffers_matches_md5_by_samples() {
     use crate::byteorder::{Endianness, LittleEndian};
 
     for bytes in 1..=4 {
-        for len in [0usize, 1, 1023, 1024, 1025, 5000] {
+        // around one buffer of every sample width, and exactly one and two
+        for len in [
+            0usize, 1, 767, 768, 769, 1023, 1024, 1025, 1536, 2048, 3072, 5000, 6144,
+        ] {
             let samples: Vec<i32> = (0..len as i32)
                 .map(|i| i.wrapping_mul(2_654_435_761u32 as i32))
                 .collect();
             let mut by_buffers = Md5::default();
             update_md5(&mut by_buffers, samples.iter().copied(), bytes);
+            // an iterator that does not know its length gives the same
+            let mut unsized_iterator = Md5::default();
+            update_md5(
+                &mut unsized_iterator,
+                samples.iter().copied().filter(|_| true),
+                bytes,
+            );
+            assert_eq!(
+                unsized_iterator.finalize(),
+                by_buffers.clone().finalize(),
+                "{bytes} bytes, {len}"
+            );
             let mut by_samples = Md5::default();
             for s in &samples {
                 match bytes {
