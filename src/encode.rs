@@ -4157,15 +4157,19 @@ fn autocorrelate(
 /// partners for all of them
 #[inline]
 fn whole_window_sums<const L: usize>(windowed: &[f64], sums: &mut [f64; L]) {
+    // the sums as a value of their own, which stays in registers for the
+    // whole loop instead of being stored after every sample
+    let mut lags = *sums;
     for window in windowed.windows(L) {
         let Some(window) = window.first_chunk::<L>() else {
-            return;
+            break;
         };
         let x = window[0];
-        for (sum, y) in sums.iter_mut().zip(window) {
+        for (sum, y) in lags.iter_mut().zip(window) {
             *sum += x * y;
         }
     }
+    *sums = lags;
 }
 
 #[test]
