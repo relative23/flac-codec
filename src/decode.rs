@@ -1925,8 +1925,9 @@ fn read_lpc_subframe<const MAX: u32, R: ReadRice, I: SignedInteger>(
 
 /// Whether the fixed-size prediction loops check their products in this
 /// build: where the compiler would otherwise turn them into vector
-/// operations, which is for x86 processors with AVX2 (see [`product`])
-const CHECK_PRODUCTS: bool = cfg!(target_feature = "avx2");
+/// operations, which is for x86-64 processors with AVX2 (see [`product`]).
+/// That is where it was measured; other targets keep the unchecked form.
+const CHECK_PRODUCTS: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
 
 /// Adds each sample's prediction to its residual, which leaves the samples:
 /// the first `coefficients.len()` values of `channel` are samples already
@@ -1989,7 +1990,7 @@ fn predict_with<const CHECKED: bool, I: SignedInteger>(
 /// never comes. That is the right choice wherever the compiler leaves these
 /// multiplications alone.
 ///
-/// For x86 processors with AVX2 it does not: it gathers the products of the
+/// For x86-64 processors with AVX2 it does not: it gathers the products of the
 /// newest samples into vector operations, with each 64-bit multiplication
 /// put together from three 32-bit ones, and every sample then has to pass
 /// through them before the next one can begin. Ordinary streams decoded half
