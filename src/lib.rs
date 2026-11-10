@@ -50,6 +50,7 @@ pub mod byteorder;
 mod crc;
 pub mod decode;
 pub mod encode;
+mod exact;
 mod frames;
 mod md5;
 pub mod metadata;

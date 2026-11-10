@@ -10,6 +10,7 @@
 
 use crate::Error;
 use crate::audio::Frame;
+use crate::exact;
 use crate::md5::Md5;
 use crate::metadata::{BlockList, ChannelMask, SeekTable};
 use bitstream_io::{BitRead, SignedBitCount};
@@ -1931,6 +1932,10 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
     }
     orders!(1 2 3 4 5 6 7 8 9 10 11 12);
 
+    if predict_long(coefficients, qlp_shift, channel) {
+        return;
+    }
+
     for split in coefficients.len()..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
 
@@ -2003,6 +2008,189 @@ fn predict_order<const N: usize, I: SignedInteger>(
         residuals[0] = I::from_i64(residuals[0].into().wrapping_add(sum >> qlp_shift));
         recent = [residuals[0].into(), recent[0], recent[1], recent[2]];
     }
+}
+
+/// `predict` for more coefficients than the fixed-size loops take, in
+/// samples of at most 32 bits; `false`, with nothing done, where that does
+/// not apply
+///
+/// A predictor of up to 32 coefficients spends nearly all its time on the
+/// sum of 32 products for each sample. The products of all but the most
+/// recent samples are summed in `f64`, which is exact here (see
+/// [`crate::exact`]) and takes two products at a time where 64-bit integers
+/// take one. They are read from a copy of the samples kept as `f64`.
+///
+/// The most recent samples are added as integers from local values, the
+/// newest last, as in `predict_order`. There are eight of them so that the
+/// `f64` copies are read well after they were stored: reading two values in
+/// one go that were stored one by one has to wait until both stores are
+/// through.
+fn predict_long<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut [I]) -> bool {
+    // the samples before the predicted one that are added as integers
+    const RECENT: usize = 8;
+    // the samples before those, which are summed in `f64`
+    const OLDER: usize = 24;
+    // how many of their products are summed side by side
+    const LANES: usize = 8;
+    // how far back a prediction reaches: the largest order
+    const BACK: usize = RECENT + OLDER;
+    // the samples kept as `f64`: the BACK before a run of samples, and the run
+    const WINDOW: usize = 256;
+    const _: () = assert!(OLDER.is_multiple_of(LANES) && BACK < WINDOW);
+
+    let order = coefficients.len();
+    if I::BITS_SIZE > 32
+        || order <= RECENT
+        || order > BACK
+        || channel.len() < order
+        || !exact::sums_are_exact(coefficients.iter().map(|c| c.unsigned_abs()))
+    {
+        return false;
+    }
+    let (near, far) = coefficients.split_at(RECENT);
+    // the older samples' coefficients, the oldest sample's first, with zeros
+    // for the samples beyond this predictor's order
+    let mut older = [0.0; OLDER];
+    for (older, coefficient) in older.iter_mut().rev().zip(far) {
+        *older = *coefficient as f64;
+    }
+    // how many of the older samples this predictor reaches, in whole groups
+    let reach = far.len().next_multiple_of(LANES);
+
+    let (warm_up, rest) = channel.split_at_mut(order);
+    // `history[i + BACK]` is the place of a run's sample `i`; what lies
+    // before the warm-up samples is only ever multiplied by zero
+    let mut history = [0.0; WINDOW];
+    for (kept, sample) in history[..BACK].iter_mut().rev().zip(warm_up.iter().rev()) {
+        *kept = (*sample).into() as f64;
+    }
+    // the samples before the one to predict, most recent first
+    let mut recent = [0i64; RECENT];
+    for (recent, sample) in recent.iter_mut().zip(warm_up.iter().rev()) {
+        *recent = (*sample).into();
+    }
+
+    for run in rest.chunks_mut(WINDOW - BACK) {
+        for (i, sample) in run.iter_mut().enumerate() {
+            let mut lanes = [0.0; LANES];
+            for (coefficients, samples) in older[OLDER - reach..]
+                .as_chunks::<LANES>()
+                .0
+                .iter()
+                .zip(history[i + OLDER - reach..i + OLDER].as_chunks::<LANES>().0)
+            {
+                for ((lane, coefficient), sample) in lanes.iter_mut().zip(coefficients).zip(samples)
+                {
+                    *lane += coefficient * sample;
+                }
+            }
+            // (in pairs, so that no addition waits for more than two others)
+            let [a, b, c, d, e, f, g, h] = lanes;
+            let mut sum = exact::integer(((a + e) + (c + g)) + ((b + f) + (d + h)));
+            for (x, y) in recent.iter().zip(near).rev() {
+                sum = sum.wrapping_add(x.wrapping_mul(*y));
+            }
+            // wrapping and truncated to the sample type, as in `predict`
+            *sample = I::from_i64((*sample).into().wrapping_add(sum >> qlp_shift));
+
+            let value: i64 = (*sample).into();
+            history[i + BACK] = value as f64;
+            recent = std::array::from_fn(|k| match k {
+                0 => value,
+                _ => recent[k - 1],
+            });
+        }
+        // the last BACK samples go before the next run
+        history.copy_within(run.len()..run.len() + BACK, 0);
+    }
+    true
+}
+
+#[test]
+fn long_prediction_matches_the_general_loop() {
+    // the loop at the end of `predict`
+    fn general(coefficients: &[i64], shift: u32, channel: &mut [i32]) {
+        for split in coefficients.len()..channel.len() {
+            let (predicted, residuals) = channel.split_at_mut(split);
+            let sum = predicted
+                .iter()
+                .rev()
+                .zip(coefficients)
+                .fold(0i64, |sum, (x, y)| {
+                    sum.wrapping_add(i64::from(*x).wrapping_mul(*y))
+                });
+            residuals[0] = (i64::from(residuals[0]).wrapping_add(sum >> shift)) as i32;
+        }
+    }
+
+    let mut seed = 0xD6E8_FEB8_6659_FD93u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..1500 {
+        // every order the function takes, with coefficients of up to 15 bits,
+        // the most a stream can hold, at the edges of their range too
+        let order = 9 + (next() % 24) as usize;
+        let precision = 2 + (next() % 14) as u32;
+        let coefficients: Vec<i64> = (0..order)
+            .map(|_| match next() % 8 {
+                0 => (1 << (precision - 1)) - 1,
+                1 => -(1 << (precision - 1)),
+                _ => i64::from((next() as i32) >> (32 - precision)),
+            })
+            .collect();
+        let shift = (next() % 32) as u32;
+        // from the warm-up samples alone to several runs of the `f64` copy,
+        // with the lengths around a run's end
+        let len = order
+            + match round % 5 {
+                0 => (next() % 3) as usize,
+                1 => 222 + (next() % 5) as usize,
+                2 => 446 + (next() % 5) as usize,
+                _ => (next() % 1200) as usize,
+            };
+        // samples and residuals of 8 to 32 bits: at 32 bits the samples
+        // wrap around, as a damaged stream's do
+        let bits = 8 + (next() % 25) as u32;
+        let samples: Vec<i32> = (0..len)
+            .map(|_| match next() % 16 {
+                0 => i32::MAX >> (32 - bits),
+                1 => i32::MIN >> (32 - bits),
+                _ => (next() as i32) >> (32 - bits),
+            })
+            .collect();
+
+        let mut expected = samples.clone();
+        general(&coefficients, shift, &mut expected);
+        let mut long = samples.clone();
+        assert!(
+            predict_long(&coefficients, shift, &mut long),
+            "round {round}"
+        );
+        assert_eq!(
+            long, expected,
+            "round {round}: order {order}, {len} samples"
+        );
+        // and `predict` as a whole gives the same
+        let mut whole = samples;
+        predict(&coefficients, shift, &mut whole);
+        assert_eq!(whole, expected, "round {round}: order {order}");
+    }
+
+    // left to the other loops: few coefficients, more than 32, fewer samples
+    // than coefficients, coefficients beyond the exact bound and wide samples
+    let mut samples = [1i32; 40];
+    assert!(!predict_long(&[1; 8], 0, &mut samples));
+    assert!(predict_long(&[1; 9], 0, &mut samples));
+    assert!(predict_long(&[1; 32], 0, &mut samples));
+    assert!(!predict_long(&[1; 33], 0, &mut samples));
+    assert!(!predict_long(&[1; 32], 0, &mut samples[..31]));
+    assert!(predict_long(&[(1 << 20) / 16 - 1; 16], 0, &mut samples));
+    assert!(!predict_long(&[(1 << 20) / 16; 16], 0, &mut samples));
+    assert!(!predict_long(&[1; 16], 0, &mut [1i64; 40]));
 }
 
 #[test]

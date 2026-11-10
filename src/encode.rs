@@ -17,6 +17,7 @@
 //! encode twice as fast.
 
 use crate::audio::Frame;
+use crate::exact;
 use crate::md5::Md5;
 use crate::metadata::{
     Application, BlockList, BlockSize, Cuesheet, Picture, PortableMetadataBlock, SeekPoint,
@@ -3589,18 +3590,16 @@ impl<'w, 'r> LpcSubframeParameters<'w, 'r> {
 }
 
 /// LPC residuals, each sample less its prediction, from sums computed
-/// exactly in floating point; an error if a residual does not fit in 32 bits
+/// exactly in floating point (see [`crate::exact`]); an error if a residual
+/// does not fit in 32 bits
 ///
-/// A sample has at most 32 bits, so while the coefficients' magnitudes add up
-/// to less than 2^20 (they always do at up to 15 bits of precision and order
-/// 32), every product of a sample and a coefficient and every sum of such
-/// products is an integer below 2^51, which `f64` holds exactly: the result
-/// is that of 64-bit integer arithmetic, in any order of summation. Unlike
-/// 64-bit integer multiplication, these loops vectorize.
+/// The result is that of 64-bit integer arithmetic, in any order of
+/// summation. Unlike 64-bit integer multiplication, these loops vectorize.
 ///
 /// Fills `residuals`, which is one residual for each sample of `channel`
 /// after its first `coefficients.len()`. Returns `None`, with nothing done,
-/// for coefficients beyond that bound or `residuals` of another length.
+/// for coefficients beyond the bound of [`crate::exact`] or `residuals` of
+/// another length.
 fn float_residuals(
     coefficients: &[i32],
     shift: u32,
@@ -3611,19 +3610,13 @@ fn float_residuals(
     }: &mut ResidualScratch,
     residuals: &mut [i32],
 ) -> Option<Result<(), ResidualOverflow>> {
-    // below this sum of the coefficients' magnitudes, every sum is an integer
-    // of magnitude below 2^51
-    const EXACT: u64 = 1 << 20;
     // how many predictions are summed side by side, in local values
     const LANES: usize = 8;
 
     let order = coefficients.len();
-    let magnitudes = coefficients
-        .iter()
-        .map(|c| u64::from(c.unsigned_abs()))
-        .sum::<u64>();
+    let magnitudes = coefficients.iter().map(|c| u64::from(c.unsigned_abs()));
     let count = residuals.len();
-    if order == 0 || magnitudes >= EXACT || channel.len() != order + count {
+    if order == 0 || !exact::sums_are_exact(magnitudes) || channel.len() != order + count {
         return None;
     }
 
@@ -3678,7 +3671,7 @@ fn float_residuals(
         .zip(predictions.iter())
         .zip(&channel[order..])
         .fold(0, |overflow, ((residual, sum), sample)| {
-            let prediction = (exact_integer(*sum) >> shift) as i32;
+            let prediction = (exact::integer(*sum) >> shift) as i32;
             *residual = sample.wrapping_sub(prediction);
             overflow | (sample ^ prediction) & (sample ^ *residual)
         });
@@ -3686,50 +3679,6 @@ fn float_residuals(
         false => Ok(()),
         true => Err(ResidualOverflow),
     })
-}
-
-/// An integer of magnitude below 2^51 that is held in a `f64`, as an `i64`
-///
-/// Adding 1.5 × 2^52 moves the value into the range from 2^52 to 2^53, where
-/// the bits of a `f64` below its exponent are the number itself less 2^52.
-/// The difference of the two bit patterns is therefore the integer. This
-/// takes an addition and a subtraction and vectorizes, where the ordinary
-/// conversion checks for values that cannot occur here and does not.
-#[inline]
-fn exact_integer(value: f64) -> i64 {
-    const OFFSET: f64 = 6_755_399_441_055_744.0;
-
-    debug_assert!(value.abs() < 2_251_799_813_685_248.0 && value.fract() == 0.0);
-    ((value + OFFSET).to_bits() as i64).wrapping_sub(OFFSET.to_bits() as i64)
-}
-
-#[test]
-fn exact_integer_is_the_integer() {
-    assert_eq!(1.5 * 2f64.powi(52), 6_755_399_441_055_744.0);
-    let limit = (1i64 << 51) - 1;
-    for value in [
-        0,
-        1,
-        -1,
-        2,
-        -2,
-        255,
-        -256,
-        limit,
-        -limit,
-        limit - 1,
-        1 - limit,
-    ] {
-        assert_eq!(exact_integer(value as f64), value);
-    }
-    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-    for _ in 0..100_000 {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let value = (seed as i64) >> (13 + seed % 51);
-        assert_eq!(exact_integer(value as f64), value);
-    }
 }
 
 #[test]
