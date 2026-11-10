@@ -21,6 +21,7 @@ pull request.
 | `ebfd19b` | Allow LPC order 32 in debug builds (a debug assertion rejected the highest order the options accept) | `fix-lpc-order-32-debug-assertion` | not in #4: issue tuffy/flac-codec#9, PR tuffy/flac-codec#10 (open) |
 | `4474e6b` | Write a residual of i32::MIN without overflowing (debug builds; found by the `roundtrip` fuzz target) | `fix-residual-min-negation` | also fixed in #4 |
 | `f57ffea` | Write STREAMINFO's bit depth without unwrapping (a damaged STREAMINFO with 1 bit per sample panicked when written back, release builds too; found by the `metadata` fuzz target) | `fix-streaminfo-low-bit-depth-write` | also fixed in #4, with the same line |
+| `711ca41` | Finalize sample and channel writers when they are dropped (`FlacSampleWriter` and `FlacChannelWriter` lost their last, partly filled block without an error; found by the thread tests) | `fix-writers-finalize-on-drop` | not in #4; not reported yet |
 
 ## Speed
 
@@ -40,11 +41,22 @@ errors the same. The first one sits alone on a `perf-*` branch based on upstream
 | `5caa7f5` | Sum residual magnitudes once at the finest partition order | `perf-encoder-partition-sums` | not offered |
 | `7a4c1e0` | Unroll LPC residuals for orders up to 12 | `perf-encoder-unrolled-residuals` | not offered |
 | `532cbf3` | Compute FIXED differences without stopping at each one | `perf-encoder-fixed-differences` | not offered |
+| `1d045ed` | Plan subframes and compute their sizes before writing (the partition code moves out of `write_residuals`; residual sizes are computed, not written into a counter) | `perf-encoder-plan-subframes` | not offered |
+| `b70f882` | Write only the two stereo subframes that are used | `perf-encoder-stereo-winners` | not offered |
+| `e46ccb1` | Write frames into memory with a 64-bit bit writer (`FrameWriter` in `src/frames.rs`, Rice codes in one step, CRC-16 over the finished frame) | `perf-encoder-frame-writer` | not offered |
+| `dcc0553` | Take whole frames from the input and hash and deinterleave them in bulk | `perf-encoder-input-path` | not offered |
+| `56026bf` | Encode frames on several threads: `Options::threads`, new public API of this branch; the output is the same for any number of threads | `perf-encoder-parallel-frames` | not offered |
+| `388d2bb` | Compute FIXED differences in a loop that vectorizes | `perf-encoder-fixed-vectorized` | not offered |
+| `6552a4b` | Compute all autocorrelation lags in one pass (each lag's sum in the same order, so bit for bit the same) | `perf-encoder-autocorrelation` | not offered |
+| `442deb7` | Keep the FIXED buffers' length between blocks | `perf-encoder-fixed-no-refill` | not offered |
 
-Each comes with its own equivalence test: `SliceBitReader` against bitstream-io's
-reader on random operations (Rice codes included), prediction and LPC residuals per
-order against the general loops, FIXED parameters against the previous algorithm,
-interleaving against `MultiZip`, CRC-16 by slices against bytes.
+Each comes with its own equivalence test: `SliceBitReader` and `FrameWriter` against
+bitstream-io's reader and writer on random operations (Rice codes included), prediction
+and LPC residuals per order against the general loops, FIXED parameters against the
+previous algorithm, interleaving and deinterleaving against `MultiZip`, CRC-16 by
+slices against bytes, planned residual sizes against written ones (failures included),
+MD5 by buffers against MD5 by samples, the autocorrelation in one pass against summing
+lag by lag (compared as bits), and several threads against one for all three writers. In debug builds every written subframe is checked against its planned size.
 
 ## Fork only
 
@@ -82,11 +94,15 @@ crates included), MIT or Apache-2.0 only, one version per crate, crates.io only.
 (any samples, layout and options must encode and decode to the same samples) and
 `decode_reference` (any input, read in pieces of any size or after a seek, must give
 the samples and the ending of commit `69e7537`, the branch before the decoder speed
-work, fetched from this fork): `cargo +nightly fuzz run <target>`.
+work, fetched from this fork) and `encode_reference` (any samples, layout and options
+on one to four threads must give the stream, or the error, of the same commit):
+`cargo +nightly fuzz run <target>`.
 
 `tests/hardening.rs` also checks that decoding from sources handing out 1, 3 or 4093
 bytes per read matches decoding from memory, for undamaged and damaged streams, and
-that a 5 MB frame decodes through the stream fallback.
+that a 5 MB frame decodes through the stream fallback, that 2, 3 and 8 threads write
+the bytes of one thread (also when the writer is dropped instead of finalized), and
+that writing more samples than declared fails the same way on several threads.
 
 ## Moving to a new upstream release
 
@@ -135,38 +151,48 @@ that a 5 MB frame decodes through the stream fallback.
   with overflow checks and debug assertions: clean. libFLAC 1.5.0 and ffmpeg 8.0.1:
   288 of 288 streams identical. Heap of a small clean stream: about 300 KiB (the
   read-ahead), damaged streams at most 527 KiB.
+- After the encoder speed work (2026-11-10): 128 tests pass, also on Rust 1.88 with
+  `rayon`; 1,000,000 damaged streams and 20,000 random encoder rounds with overflow
+  checks and debug assertions (which check every written subframe against its planned
+  size): clean; libFLAC 1.5.0 and ffmpeg 8.0.1: 288 of 288 streams identical; the
+  encoder output for the 64 IETF subset files is byte-identical to upstream 1.3.3 at
+  every commit, and for 1, 2, 4, 8 and 16 threads.
+- cargo-fuzz on the encoder, 30 minutes per target with AddressSanitizer and debug
+  assertions, one to four threads: `encode_reference` 2,850,910 runs before the last
+  three encoder commits and 1,817,397 after them, each with the stream or error of
+  `69e7537`; `roundtrip` 1,141,118 and 890,351 runs; nothing found.
+- The thread tests found fix 10: dropping a `FlacSampleWriter` or `FlacChannelWriter`
+  lost the last partial block in upstream 1.3.3 too (10,000 samples written, 8,192
+  decoded).
 
-## Speed measurements (2026-11-08, one pinned core, 64 IETF subset files with 98.6 million samples)
+## Speed measurements (2026-11-10, one pinned core, 64 IETF subset files with 98.6 million samples)
 
-Best of 5 runs, three rounds alternating between this branch before the decoder speed
-work (`69e7537`, all fixes and `772b45a`) and after it (`532cbf3`); libFLAC 1.5.0's
-`flac` on the same core in a container. Upstream 1.3.3 measured on 2026-11-07 under the
-same conditions:
+Best of 5 runs, three rounds alternating between upstream 1.3.3, this branch before the
+encoder speed work of 2026-11-08 to 10 (`ee6d61f`) and after it (`442deb7`); libFLAC
+1.5.0's `flac` on the same core in a container, right after:
 
-| | upstream 1.3.3 | `69e7537` | `532cbf3` | libFLAC 1.5.0 |
+| | upstream 1.3.3 | `ee6d61f` | `442deb7` | libFLAC 1.5.0 |
 |---|---|---|---|---|
-| decode to samples | 1.566 s | 1.493 s | 0.784 s | |
-| decode with MD5 check (`verify`, `flac -t`) | 1.925 s | 1.936 s | 1.049 s | 0.837 s |
-| encode, default (`flac -5`) | 5.639 s | 4.664 s | 4.174 s | 1.153 s |
-| encode, best (`flac -8`) | 6.111 s | 5.204 s | 4.618 s | 2.867 s |
-| encode, fast (`flac -0`) | 2.412 s | 2.387 s | 2.307 s | 0.680 s |
+| encode, default (`flac -5`) | 5.822 s | 4.321 s | 1.420 s | 1.176 s |
+| encode, best (`flac -8`) | 6.302 s | 4.692 s | 1.666 s | 2.985 s |
+| encode, fast (`flac -0`) | 2.521 s | 2.354 s | 0.801 s | 0.699 s |
+| decode to samples | 1.620 s | 0.792 s | 0.804 s | |
+| decode with MD5 check (`verify`, `flac -t`) | 1.985 s | 1.094 s | 1.114 s | 0.855 s |
 
-Against upstream 1.3.3, decoding is 2.0 times as fast and decoding with the MD5 check
-1.8 times; encoding takes 26 % less time at the default and best settings. The output
-of the encoder is byte-identical in every column. libFLAC is still 1.25 times as fast
-at checking and 1.6 to 3.6 times at encoding; with `rayon` on all 32 threads the
-default encode took 2.84 s on 2026-11-07.
+Against upstream 1.3.3, encoding is 3.1 to 4.1 times as fast and decoding 2.0 times
+(1.8 times with the MD5 check). The output of the encoder is byte-identical in every
+column. Against libFLAC on one core: 1.8 times as fast at the best setting, 1.21 times
+slower at the default, 1.15 times slower at the fast setting, 1.30 times slower at
+checking. With `Options::threads`, the default encode of the 64 files takes 1.04 s on
+2 threads, 0.73 s on 4, 0.57 s on 8 and 0.53 s on 16 (the files are short; a long
+stream scales further).
 
-The presets do not match libFLAC's levels exactly, and libFLAC's times include
-reading WAV files and writing FLAC files on tmpfs, while flac-codec works in memory.
+The presets do not match libFLAC's levels exactly, and libFLAC's times include reading
+WAV files and writing FLAC files on tmpfs, while flac-codec works in memory.
 
-Where the encoder's time goes now (callgrind on a CD file): writing the chosen
-subframes into bit recorders about 20 % (four per stereo frame, of which two are used),
-counting candidates through `BitsWritten` 9 %, FIXED residuals and their order choice
-10 %, copies 4 %, MD5 3 %. Its instructions per sample fell by 22 % with the speed work,
-the time by 11 %: what is left is mostly writing memory.
-
-Next, in this order: compute candidate sizes arithmetically and write only the two
-stereo subframes that are used (the partition code moves out of `write_residuals` for
-that); a word-based bit writer; encoding whole frames in parallel, in order, for the
-wall-clock time of long takes.
+Where the encoder's time goes now (callgrind on a CD file; instruction counts, which
+understate floating-point chains): writing Rice codes about 10 %, the FIXED search and
+its magnitude sums about 20 %, LPC residuals 10 %, exact residual sizes 4 %, MD5 4 %,
+the window and autocorrelation about 10 %. Tried and dropped because they were slower:
+summing FIXED magnitudes inside the difference loop, and a sign-bit overflow check
+inside `Vec::extend`.

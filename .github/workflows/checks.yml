@@ -121,7 +121,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,7 +131,7 @@ jobs:
       - name: two minutes per target
         run: |
           cd fuzz
-          for target in decode seek metadata roundtrip decode_reference; do
+          for target in decode seek metadata roundtrip decode_reference encode_reference; do
             cargo fuzz run "$target" -- -max_total_time=120 -rss_limit_mb=2048 -timeout=10
           done
 
