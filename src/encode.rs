@@ -3374,10 +3374,10 @@ fn fixed_parameters<'c>(
             .into_iter()
             .enumerate()
             .min_by_key(|(_, residuals)| {
-                residuals[(residuals.len() - min_fixed)..]
-                    .iter()
-                    .map(|r| u64::from(r.unsigned_abs()))
-                    .sum::<u64>()
+                sum_of(
+                    &residuals[(residuals.len() - min_fixed)..],
+                    i32::unsigned_abs,
+                )
             })
             .map(|(order, residuals)| (order as u8, &channel[0..order], residuals))
             .unwrap()
@@ -4618,7 +4618,7 @@ fn best_partitions<'r, const RICE_MAX: u32>(
     let finest = block_size >> max_order;
     let sums: Vec<u64> = residuals
         .rchunks(finest)
-        .map(|partition| partition.iter().map(|i| u64::from(i.unsigned_abs())).sum())
+        .map(|partition| sum_of(partition, i32::unsigned_abs))
         .collect();
 
     (0..=max_order)
@@ -4744,15 +4744,12 @@ fn partitions_bits<const RICE_MAX: u32>(partitions: &[Partition<'_, RICE_MAX>]) 
                 Some(
                     parameter
                         + residuals.len() as u64 * (1 + u64::from(rice))
-                        + residuals
-                            .iter()
-                            .map(|s| {
-                                // zigzag folding without a branch: twice the value,
-                                // with every bit flipped when it is negative
-                                let folded = ((*s << 1) ^ (*s >> 31)) as u32;
-                                u64::from(folded >> rice)
-                            })
-                            .sum::<u64>(),
+                        + sum_of(residuals, |s| {
+                            // zigzag folding without a branch: twice the value,
+                            // with every bit flipped when it is negative
+                            let folded = ((s << 1) ^ (s >> 31)) as u32;
+                            folded >> rice
+                        }),
                 )
             }
             ResidualPartitionHeader::Escaped { escape_size } => {
@@ -4827,6 +4824,95 @@ fn plan_residuals<'r>(
     } else {
         CodingMethod::Rice(best_partitions::<0b1111>(options, block_size, residuals))
     }
+}
+
+/// The sum of `term` over `values`, as adding every term in 64 bits gives it
+///
+/// The terms are added in 32 bits, `RUN` values at a time, which the compiler
+/// vectorizes four values wide where a 64-bit sum takes two. A run whose
+/// terms are all below `SMALL` cannot overflow 32 bits; any other run, which
+/// ordinary audio does not have, is added again in 64 bits.
+#[inline]
+fn sum_of(values: &[i32], term: impl Fn(i32) -> u32) -> u64 {
+    const RUN: usize = 256;
+    const SMALL: u32 = 1 << 24;
+    const _: () = assert!(RUN as u64 * (SMALL as u64 - 1) <= u32::MAX as u64);
+
+    values
+        .chunks(RUN)
+        .map(|run| {
+            // the wrapped sum, and every bit that is set in some term
+            let (sum, bits) = run.iter().fold((0u32, 0u32), |(sum, bits), value| {
+                let term = term(*value);
+                (sum.wrapping_add(term), bits | term)
+            });
+            match bits < SMALL {
+                true => u64::from(sum),
+                false => run.iter().map(|value| u64::from(term(*value))).sum(),
+            }
+        })
+        .sum()
+}
+
+#[test]
+fn sum_of_matches_the_64_bit_sum() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut large_runs = 0;
+    for round in 0..4000 {
+        // from nothing to several runs, with the run length and its neighbours
+        let len = match round % 4 {
+            0 => (next() % 8) as usize,
+            1 => 255 + (next() % 3) as usize,
+            _ => (next() % 1500) as usize,
+        };
+        // small values, values around the 24-bit limit of a run, and the
+        // largest ones, alone in a run of small values or all over it
+        let bits = [1, 8, 16, 23, 24, 25, 31, 32][(next() % 8) as usize];
+        let rare = next() % 3 == 0;
+        let values: Vec<i32> = (0..len)
+            .map(|_| match next() % if rare { 300 } else { 6 } {
+                0 => i32::MIN,
+                1 => i32::MAX,
+                2 => (1 << 24) - (next() % 3) as i32,
+                3 => -(1 << 24) + (next() % 3) as i32,
+                _ => (next() as i32) >> (32 - bits),
+            })
+            .collect();
+        large_runs += usize::from(values.iter().any(|v| v.unsigned_abs() >= 1 << 24));
+
+        let magnitudes = values
+            .iter()
+            .map(|v| u64::from(v.unsigned_abs()))
+            .sum::<u64>();
+        assert_eq!(
+            sum_of(&values, i32::unsigned_abs),
+            magnitudes,
+            "round {round}"
+        );
+
+        // the other use: what is left of a folded value above its Rice parameter
+        let rice = (next() % 31) as u32;
+        let folded = |s: i32| ((s << 1) ^ (s >> 31)) as u32 >> rice;
+        let quotients = values.iter().map(|v| u64::from(folded(*v))).sum::<u64>();
+        assert_eq!(
+            sum_of(&values, folded),
+            quotients,
+            "round {round}, rice {rice}"
+        );
+    }
+    // both ways of adding a run were compared
+    assert!(large_runs > 500 && large_runs < 3500, "{large_runs}");
+
+    // a run of the largest terms, which 32 bits cannot hold
+    assert_eq!(sum_of(&[i32::MIN; 256], i32::unsigned_abs), 256 << 31);
+    assert_eq!(sum_of(&[-1; 600], |v| v as u32), 600 * u64::from(u32::MAX));
+    assert_eq!(sum_of(&[], i32::unsigned_abs), 0);
 }
 
 fn try_join<A, B, RA, RB, E>(oper_a: A, oper_b: B) -> Result<(RA, RB), E>
