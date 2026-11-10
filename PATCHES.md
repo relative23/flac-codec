@@ -49,6 +49,10 @@ errors the same. The first one sits alone on a `perf-*` branch based on upstream
 | `388d2bb` | Compute FIXED differences in a loop that vectorizes | `perf-encoder-fixed-vectorized` | not offered |
 | `6552a4b` | Compute all autocorrelation lags in one pass (each lag's sum in the same order, so bit for bit the same) | `perf-encoder-autocorrelation` | not offered |
 | `442deb7` | Keep the FIXED buffers' length between blocks | `perf-encoder-fixed-no-refill` | not offered |
+| `c26405c` | Add the newest sample's product last in the prediction (the decoder's loop waited on a chain of additions per sample) | `perf-decoder-prediction-order` | not offered |
+| `7248eba` | Hash the samples on a thread of its own next to the encoding threads (with `Options::threads` above 1) | `perf-encoder-threads-md5` | not offered |
+| `b32cde9` | Compute residual sizes without a branch per residual | `perf-encoder-size-loop` | not offered |
+| `c51a15b` | Fold residuals without a branch when writing Rice codes | `perf-encoder-rice-fold` | not offered |
 
 Each comes with its own equivalence test: `SliceBitReader` and `FrameWriter` against
 bitstream-io's reader and writer on random operations (Rice codes included), prediction
@@ -161,38 +165,67 @@ that writing more samples than declared fails the same way on several threads.
   assertions, one to four threads: `encode_reference` 2,850,910 runs before the last
   three encoder commits and 1,817,397 after them, each with the stream or error of
   `69e7537`; `roundtrip` 1,141,118 and 890,351 runs; nothing found.
+- After the later speed commits (`388d2bb` to `c51a15b`, 2026-11-10): 128 tests, also
+  on Rust 1.88 with `rayon`; 1,000,000 damaged streams and 20,000 random encoder rounds
+  with overflow checks and debug assertions: clean; libFLAC 1.5.0 and ffmpeg 8.0.1:
+  288 of 288; encoder output byte-identical to upstream 1.3.3 at every commit and for
+  1 to 16 threads.
+- cargo-fuzz after `c51a15b`, 30 minutes per target: `decode_reference` 84,950 runs,
+  `encode_reference` 1,197,445, `roundtrip` 890,210, nothing found.
 - The thread tests found fix 10: dropping a `FlacSampleWriter` or `FlacChannelWriter`
   lost the last partial block in upstream 1.3.3 too (10,000 samples written, 8,192
   decoded).
 
 ## Speed measurements (2026-11-10, one pinned core, 64 IETF subset files with 98.6 million samples)
 
-Best of 5 runs, three rounds alternating between upstream 1.3.3, this branch before the
-encoder speed work of 2026-11-08 to 10 (`ee6d61f`) and after it (`442deb7`); libFLAC
-1.5.0's `flac` on the same core in a container, right after:
+Best of 5 runs, three rounds alternating between upstream 1.3.3 and this branch
+(`c51a15b`); libFLAC 1.5.0's `flac` on the same core in a container, right after. The
+spread between rounds was below 1 %.
 
-| | upstream 1.3.3 | `ee6d61f` | `442deb7` | libFLAC 1.5.0 |
-|---|---|---|---|---|
-| encode, default (`flac -5`) | 5.822 s | 4.321 s | 1.420 s | 1.176 s |
-| encode, best (`flac -8`) | 6.302 s | 4.692 s | 1.666 s | 2.985 s |
-| encode, fast (`flac -0`) | 2.521 s | 2.354 s | 0.801 s | 0.699 s |
-| decode to samples | 1.620 s | 0.792 s | 0.804 s | |
-| decode with MD5 check (`verify`, `flac -t`) | 1.985 s | 1.094 s | 1.114 s | 0.855 s |
+| | upstream 1.3.3 | `c51a15b` | libFLAC 1.5.0 |
+|---|---|---|---|
+| encode, default (`flac -5`) | 5.731 s | 1.356 s | 1.158 s |
+| encode, best (`flac -8`) | 6.206 s | 1.571 s | 2.911 s |
+| encode, fast (`flac -0`) | 2.464 s | 0.757 s | 0.691 s |
+| decode to samples | 1.594 s | 0.751 s | |
+| decode with MD5 check (`verify`, `flac -t`) | 1.955 s | 1.031 s | 0.846 s |
 
-Against upstream 1.3.3, encoding is 3.1 to 4.1 times as fast and decoding 2.0 times
-(1.8 times with the MD5 check). The output of the encoder is byte-identical in every
-column. Against libFLAC on one core: 1.8 times as fast at the best setting, 1.21 times
-slower at the default, 1.15 times slower at the fast setting, 1.30 times slower at
-checking. With `Options::threads`, the default encode of the 64 files takes 1.04 s on
-2 threads, 0.73 s on 4, 0.57 s on 8 and 0.53 s on 16 (the files are short; a long
-stream scales further).
+Against upstream 1.3.3, encoding is 3.3 to 4.2 times as fast and decoding 2.1 times
+(1.9 times with the MD5 check). The output of the encoder is byte-identical. Against
+libFLAC on one core: 1.85 times as fast at the best setting, 1.17 times slower at the
+default, 1.10 times slower at the fast setting, 1.22 times slower at checking.
+
+With `Options::threads` (plus the hashing thread), the default encode of the 64 files
+takes 0.74 s on 2 threads, 0.50 s on 4 and 0.45 s on 8. A long stream, default
+settings, one core against 8 threads against libFLAC `-5` on one core:
+
+| | one core | 8 threads | libFLAC `-5` |
+|---|---|---|---|
+| 24 bit, 96 kHz, stereo, 175 s | 0.59 s (298 times real time) | 0.18 s | 0.49 s |
+| 16 bit, 44.1 kHz, stereo, 140 s | 0.18 s (760 times real time) | 0.05 s | 0.15 s |
+
+Beyond 8 threads the MD5 of the samples, which cannot be split, sets the pace.
 
 The presets do not match libFLAC's levels exactly, and libFLAC's times include reading
 WAV files and writing FLAC files on tmpfs, while flac-codec works in memory.
 
-Where the encoder's time goes now (callgrind on a CD file; instruction counts, which
-understate floating-point chains): writing Rice codes about 10 %, the FIXED search and
-its magnitude sums about 20 %, LPC residuals 10 %, exact residual sizes 4 %, MD5 4 %,
-the window and autocorrelation about 10 %. Tried and dropped because they were slower:
-summing FIXED magnitudes inside the difference loop, and a sign-bit overflow check
-inside `Vec::extend`.
+Where the time goes now (perf, by time, default settings on one core, 24 bit at
+96 kHz): LPC residuals 21 %, MD5 23 %, window, autocorrelation and planning 11 %, the
+FIXED search 12 %, writing Rice codes 8 %, exact residual sizes 7 % (before `b32cde9`),
+partition sums 6 %. The multiplications and the MD5 are at what scalar code does;
+libFLAC uses AVX2 for the former, chosen at run time.
+
+Building for newer processors (`-C target-cpu=x86-64-v3`, AVX2) is a choice of the
+application, not of this crate: measured on an AMD Ryzen 9 9950X3D, the default encode
+of the 64 files takes 1.11 s instead of 1.41 s (same bytes), below libFLAC's 1.16 s,
+but decoding takes 0.96 s instead of 0.75 s, because the vectorized prediction reads
+back samples it has only just written. Until that is solved the baseline build is the
+better one for an application that also decodes.
+
+The decode figures above are dominated by three test files that use only 32nd-order
+predictors (one of them 8 channels at 192 kHz): ordinary streams decode at about 5 ns
+per sample, 0.38 s for the other 61 files.
+
+Tried and dropped because they were slower: summing FIXED magnitudes inside the
+difference loop, a sign-bit overflow check inside `Vec::extend`, and keeping the whole
+prediction history in a local array.
