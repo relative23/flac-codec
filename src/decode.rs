@@ -1935,28 +1935,43 @@ fn read_lpc_subframe<const MAX: u32, R: ReadRice, I: SignedInteger>(
     Ok(())
 }
 
+/// Whether the fixed-size prediction loops check their products in this
+/// build: where the compiler would otherwise turn them into vector
+/// operations, which is for x86 processors with AVX2 (see [`product`])
+const CHECK_PRODUCTS: bool = cfg!(target_feature = "avx2");
+
+/// Adds each sample's prediction to its residual, which leaves the samples:
+/// the first `coefficients.len()` values of `channel` are samples already
+#[inline]
 fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut [I]) {
+    predict_with::<CHECK_PRODUCTS, I>(coefficients, qlp_shift, channel)
+}
+
+/// `predict` with or without checked products, which give the same samples
+fn predict_with<const CHECKED: bool, I: SignedInteger>(
+    coefficients: &[i64],
+    qlp_shift: u32,
+    channel: &mut [I],
+) {
     // fixed-size loops for the usual orders (FIXED 1 to 4, LPC up to 12),
-    // which the compiler unrolls; the same arithmetic as the general loop
+    // which the compiler unrolls, and one for long predictors; the same
+    // arithmetic as the general loop, which takes what they leave
     macro_rules! orders {
         ($($n:literal)*) => {
             match coefficients.len() {
-                $($n => {
-                    if let Ok(coefficients) = <&[i64; $n]>::try_from(coefficients) {
-                        return predict_order(coefficients, qlp_shift, channel);
+                $($n => match <&[i64; $n]>::try_from(coefficients) {
+                    Ok(coefficients) => {
+                        predict_order::<$n, CHECKED, I>(coefficients, qlp_shift, channel)
                     }
-                })*
-                _ => {}
+                    Err(_) => coefficients.len(),
+                },)*
+                _ => predict_long(coefficients, qlp_shift, channel),
             }
         };
     }
-    orders!(1 2 3 4 5 6 7 8 9 10 11 12);
+    let rest = orders!(1 2 3 4 5 6 7 8 9 10 11 12);
 
-    if predict_long(coefficients, qlp_shift, channel) {
-        return;
-    }
-
-    for split in coefficients.len()..channel.len() {
+    for split in rest..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
 
         // wrapping arithmetic in 64 bits, truncated to the sample type:
@@ -1979,7 +1994,36 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
     }
 }
 
-/// `predict` for exactly `N` coefficients
+/// A sample's product with its coefficient in `predict_order`, or `None`
+/// where that loop has to leave the rest of the block to the general one
+///
+/// Unchecked, the product wraps around like every other one, and `None`
+/// never comes. That is the right choice wherever the compiler leaves these
+/// multiplications alone.
+///
+/// For x86 processors with AVX2 it does not: it gathers the products of the
+/// newest samples into vector operations, with each 64-bit multiplication
+/// put together from three 32-bit ones, and every sample then has to pass
+/// through them before the next one can begin. Ordinary streams decoded half
+/// as fast in such a build. A checked multiplication stays the single
+/// instruction it is.
+///
+/// Samples of at most 32 bits and coefficients of at most 15, which is all a
+/// stream can hold, cannot make the product overflow. The wider samples of a
+/// 32-bit stream's side channel can, once damage has made them grow. The
+/// loop stops there, and the general loop goes on from that sample with
+/// wrapping arithmetic: the samples are the same either way.
+#[inline(always)]
+fn product<const CHECKED: bool>(sample: i64, coefficient: i64) -> Option<i64> {
+    match CHECKED {
+        true => sample.checked_mul(coefficient),
+        false => Some(sample.wrapping_mul(coefficient)),
+    }
+}
+
+/// `predict` for exactly `N` coefficients: the first sample that is left to
+/// the general loop, which is the end of `channel` unless a checked product
+/// overflowed
 ///
 /// Each sample depends on the one just computed, so the order of the sum
 /// decides how fast the loop runs: the older samples' products are added
@@ -1990,15 +2034,15 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
 /// local values, so that no read of `channel` touches a sample that was only
 /// just written.
 #[inline]
-fn predict_order<const N: usize, I: SignedInteger>(
+fn predict_order<const N: usize, const CHECKED: bool, I: SignedInteger>(
     coefficients: &[i64; N],
     qlp_shift: u32,
     channel: &mut [I],
-) {
+) -> usize {
     const RECENT: usize = 4;
 
     if channel.len() < N {
-        return;
+        return N;
     }
     // the coefficients of the recent samples, and of the older ones
     let (near, far) = coefficients.split_at(N.min(RECENT));
@@ -2010,29 +2054,36 @@ fn predict_order<const N: usize, I: SignedInteger>(
 
     for split in N..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
-        // wrapping in 64 bits, truncated to the sample type, as in `predict`:
+        // in 64 bits, truncated to the sample type, as in `predict_with`:
         // the oldest samples first
         let mut sum = 0i64;
         if N > RECENT {
-            sum = predicted[split - N..split - RECENT]
+            for (x, y) in predicted[split - N..split - RECENT]
                 .iter()
                 .zip(far.iter().rev())
-                .fold(sum, |sum, (x, y)| {
-                    sum.wrapping_add((*x).into().wrapping_mul(*y))
-                });
+            {
+                let Some(product) = product::<CHECKED>((*x).into(), *y) else {
+                    return split;
+                };
+                sum = sum.wrapping_add(product);
+            }
         }
         // then the recent ones, the newest last
         for (x, y) in recent.iter().zip(near).rev() {
-            sum = sum.wrapping_add(x.wrapping_mul(*y));
+            let Some(product) = product::<CHECKED>(*x, *y) else {
+                return split;
+            };
+            sum = sum.wrapping_add(product);
         }
         residuals[0] = I::from_i64(residuals[0].into().wrapping_add(sum >> qlp_shift));
         recent = [residuals[0].into(), recent[0], recent[1], recent[2]];
     }
+    channel.len()
 }
 
 /// `predict` for more coefficients than the fixed-size loops take, in
-/// samples of at most 32 bits; `false`, with nothing done, where that does
-/// not apply
+/// samples of at most 32 bits: the first sample that is left to the general
+/// loop, which is the first one of all where this loop does not apply
 ///
 /// A predictor of up to 32 coefficients spends nearly all its time on the
 /// sum of 32 products for each sample. The products of all but the most
@@ -2045,7 +2096,13 @@ fn predict_order<const N: usize, I: SignedInteger>(
 /// `f64` copies are read well after they were stored: reading two values in
 /// one go that were stored one by one has to wait until both stores are
 /// through.
-fn predict_long<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut [I]) -> bool {
+// (a function of its own: inlined, its speed varied by 2 % with its caller)
+#[inline(never)]
+fn predict_long<I: SignedInteger>(
+    coefficients: &[i64],
+    qlp_shift: u32,
+    channel: &mut [I],
+) -> usize {
     // the samples before the predicted one that are added as integers
     const RECENT: usize = 8;
     // the samples before those, which are summed in `f64`
@@ -2065,7 +2122,7 @@ fn predict_long<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel:
         || channel.len() < order
         || !exact::sums_are_exact(coefficients.iter().map(|c| c.unsigned_abs()))
     {
-        return false;
+        return order;
     }
     let (near, far) = coefficients.split_at(RECENT);
     // the older samples' coefficients, the oldest sample's first, with zeros
@@ -2110,7 +2167,7 @@ fn predict_long<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel:
             for (x, y) in recent.iter().zip(near).rev() {
                 sum = sum.wrapping_add(x.wrapping_mul(*y));
             }
-            // wrapping and truncated to the sample type, as in `predict`
+            // wrapping and truncated to the sample type, as in `predict_with`
             *sample = I::from_i64((*sample).into().wrapping_add(sum >> qlp_shift));
 
             let value: i64 = (*sample).into();
@@ -2123,7 +2180,7 @@ fn predict_long<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel:
         // the last BACK samples go before the next run
         history.copy_within(run.len()..run.len() + BACK, 0);
     }
-    true
+    channel.len()
 }
 
 #[test]
@@ -2185,32 +2242,30 @@ fn long_prediction_matches_the_general_loop() {
 
         let mut expected = samples.clone();
         general(&coefficients, shift, &mut expected);
+        let case = format!("round {round}: order {order}, {len} samples");
         let mut long = samples.clone();
-        assert!(
-            predict_long(&coefficients, shift, &mut long),
-            "round {round}"
-        );
-        assert_eq!(
-            long, expected,
-            "round {round}: order {order}, {len} samples"
-        );
+        assert_eq!(predict_long(&coefficients, shift, &mut long), len);
+        assert_eq!(long, expected, "{case}");
         // and `predict` as a whole gives the same
         let mut whole = samples;
         predict(&coefficients, shift, &mut whole);
-        assert_eq!(whole, expected, "round {round}: order {order}");
+        assert_eq!(whole, expected, "{case}");
     }
 
     // left to the other loops: few coefficients, more than 32, fewer samples
     // than coefficients, coefficients beyond the exact bound and wide samples
+    // (the result is the first sample left to the general loop)
     let mut samples = [1i32; 40];
-    assert!(!predict_long(&[1; 8], 0, &mut samples));
-    assert!(predict_long(&[1; 9], 0, &mut samples));
-    assert!(predict_long(&[1; 32], 0, &mut samples));
-    assert!(!predict_long(&[1; 33], 0, &mut samples));
-    assert!(!predict_long(&[1; 32], 0, &mut samples[..31]));
-    assert!(predict_long(&[(1 << 20) / 16 - 1; 16], 0, &mut samples));
-    assert!(!predict_long(&[(1 << 20) / 16; 16], 0, &mut samples));
-    assert!(!predict_long(&[1; 16], 0, &mut [1i64; 40]));
+    assert_eq!(predict_long(&[1; 8], 0, &mut samples), 8);
+    assert_eq!(predict_long(&[1; 9], 0, &mut samples), 40);
+    assert_eq!(predict_long(&[1; 32], 0, &mut samples), 40);
+    assert_eq!(predict_long(&[1; 33], 0, &mut samples), 33);
+    assert_eq!(predict_long(&[1; 32], 0, &mut samples[..31]), 32);
+    let within = [(1 << 20) / 16 - 1; 16];
+    assert_eq!(predict_long(&within, 0, &mut samples), 40);
+    let beyond = [(1 << 20) / 16; 16];
+    assert_eq!(predict_long(&beyond, 0, &mut samples), 16);
+    assert_eq!(predict_long(&[1; 16], 0, &mut [1i64; 40]), 16);
 }
 
 #[test]
@@ -2240,9 +2295,12 @@ fn prediction_by_order_matches_the_general_loop() {
                     });
                 residuals[0] = (i64::from(residuals[0]).wrapping_add(sum >> shift)) as i32;
             }
-            let mut fast = samples.clone();
-            predict(&coefficients, shift, &mut fast);
-            assert_eq!(fast, general, "order {order}");
+            let mut unchecked = samples.clone();
+            predict_with::<false, _>(&coefficients, shift, &mut unchecked);
+            assert_eq!(unchecked, general, "order {order}");
+            let mut checked = samples.clone();
+            predict_with::<true, _>(&coefficients, shift, &mut checked);
+            assert_eq!(checked, general, "order {order}");
         }
     }
 }
@@ -2273,6 +2331,51 @@ fn prediction_overflow_wraps() {
     assert_eq!(
         wide,
         [i64::MAX, second, 1i64.wrapping_add(second.wrapping_mul(2))]
+    );
+}
+
+#[test]
+fn checked_products_leave_overflow_to_the_general_loop() {
+    // wide samples that grow until their products no longer fit in 64 bits:
+    // a loop with checked products stops there, and the block comes out as
+    // with wrapping products all the way
+    for order in 1..=12usize {
+        let coefficients: Vec<i64> = (0..order).map(|k| 3 + k as i64).collect();
+        let mut samples = vec![1i64 << 40; order];
+        samples.extend((0..60).map(|residual| residual - 30));
+
+        let mut general = samples.clone();
+        let mut overflowed = false;
+        for split in order..general.len() {
+            let (predicted, residuals) = general.split_at_mut(split);
+            let sum = predicted
+                .iter()
+                .rev()
+                .zip(&coefficients)
+                .fold(0i64, |sum, (x, y)| {
+                    overflowed |= x.checked_mul(*y).is_none();
+                    sum.wrapping_add(x.wrapping_mul(*y))
+                });
+            residuals[0] = residuals[0].wrapping_add(sum >> 1);
+        }
+        assert!(overflowed, "order {order}");
+
+        let mut checked = samples.clone();
+        predict_with::<true, _>(&coefficients, 1, &mut checked);
+        assert_eq!(checked, general, "order {order}");
+        let mut unchecked = samples.clone();
+        predict_with::<false, _>(&coefficients, 1, &mut unchecked);
+        assert_eq!(unchecked, general, "order {order}");
+    }
+
+    // the checked loop stops inside the block, the unchecked one never does
+    let mut samples = vec![1i64 << 40];
+    samples.extend([0; 60]);
+    let stopped = predict_order::<1, true, i64>(&[3], 0, &mut samples.clone());
+    assert!(1 < stopped && stopped < samples.len(), "{stopped}");
+    assert_eq!(
+        predict_order::<1, false, i64>(&[3], 0, &mut samples),
+        samples.len()
     );
 }
 
