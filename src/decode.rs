@@ -1937,12 +1937,13 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
         // a damaged stream wraps around in debug builds as it does in
         // release builds instead of panicking (its frame CRC rejects
         // the result afterwards)
+        // (the oldest sample's product first and the newest one's last, which
+        // lets most of the sum be ready before the newest sample is)
         residuals[0] = I::from_i64(
             residuals[0].into().wrapping_add(
-                predicted
+                predicted[split - coefficients.len()..]
                     .iter()
-                    .rev()
-                    .zip(coefficients)
+                    .zip(coefficients.iter().rev())
                     .fold(0i64, |sum, (x, y)| {
                         sum.wrapping_add((*x).into().wrapping_mul(*y))
                     })
@@ -1953,26 +1954,53 @@ fn predict<I: SignedInteger>(coefficients: &[i64], qlp_shift: u32, channel: &mut
 }
 
 /// `predict` for exactly `N` coefficients
+///
+/// Each sample depends on the one just computed, so the order of the sum
+/// decides how fast the loop runs: the older samples' products are added
+/// first, and the newest sample's product last, from a local value instead of
+/// from `channel`. The processor then has everything but one product and
+/// one addition ready when the newest sample arrives. (Wrapping addition
+/// gives the same sum in any order.) The four most recent samples stay in
+/// local values, so that no read of `channel` touches a sample that was only
+/// just written.
 #[inline]
 fn predict_order<const N: usize, I: SignedInteger>(
     coefficients: &[i64; N],
     qlp_shift: u32,
     channel: &mut [I],
 ) {
+    const RECENT: usize = 4;
+
+    if channel.len() < N {
+        return;
+    }
+    // the coefficients of the recent samples, and of the older ones
+    let (near, far) = coefficients.split_at(N.min(RECENT));
+    // the samples before the one to predict, most recent first
+    let mut recent = [0i64; RECENT];
+    for (r, sample) in recent.iter_mut().zip(channel[..N].iter().rev()) {
+        *r = (*sample).into();
+    }
+
     for split in N..channel.len() {
         let (predicted, residuals) = channel.split_at_mut(split);
-        let Some(history) = predicted.last_chunk::<N>() else {
-            return;
-        };
-        // wrapping in 64 bits, truncated to the sample type, as in `predict`
-        let sum = history
-            .iter()
-            .rev()
-            .zip(coefficients)
-            .fold(0i64, |sum, (x, y)| {
-                sum.wrapping_add((*x).into().wrapping_mul(*y))
-            });
+        // wrapping in 64 bits, truncated to the sample type, as in `predict`:
+        // the oldest samples first
+        let mut sum = 0i64;
+        if N > RECENT {
+            sum = predicted[split - N..split - RECENT]
+                .iter()
+                .zip(far.iter().rev())
+                .fold(sum, |sum, (x, y)| {
+                    sum.wrapping_add((*x).into().wrapping_mul(*y))
+                });
+        }
+        // then the recent ones, the newest last
+        for (x, y) in recent.iter().zip(near).rev() {
+            sum = sum.wrapping_add(x.wrapping_mul(*y));
+        }
         residuals[0] = I::from_i64(residuals[0].into().wrapping_add(sum >> qlp_shift));
+        recent = [residuals[0].into(), recent[0], recent[1], recent[2]];
     }
 }
 
