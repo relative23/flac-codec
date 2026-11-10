@@ -4427,14 +4427,9 @@ fn write_partition<const RICE_MAX: u32, W: WriteRice>(
     match partition.header {
         ResidualPartitionHeader::Standard { rice } => {
             partition.residuals.iter().try_for_each(|s| {
-                w.write_rice(
-                    rice,
-                    if s.is_negative() {
-                        ((s.unsigned_abs() - 1) << 1) + 1
-                    } else {
-                        (*s as u32) << 1
-                    },
-                )
+                // zigzag folding without a branch: twice the value, with
+                // every bit flipped when it is negative
+                w.write_rice(rice, ((*s << 1) ^ (*s >> 31)) as u32)
             })?;
         }
         ResidualPartitionHeader::Escaped { escape_size } => {
