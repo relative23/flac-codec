@@ -62,6 +62,9 @@ errors the same. The first one sits alone on a `perf-*` branch based on upstream
 | `99d472b` | Convert a buffer of samples at a time before hashing | `perf-encoder-md5-input` | not offered |
 | `fdcd6f2` | Compute CRC-16 sixteen bytes at a time | `perf-crc16-sixteen-bytes` | not offered |
 | `6b174e8` | Drop the MD5's `io::Write`, unused since `7dd73b2` | same | not offered |
+| `510c45c` | Check the products of the fixed-size prediction loops in builds for x86 processors with AVX2 (`CHECK_PRODUCTS`), where the compiler otherwise turns them into vector operations every sample has to pass through; an overflow leaves the rest of the block to the general loop, with the same samples | `perf-decoder-checked-products` | not offered |
+| `f8c60a4` | Read a partition's Rice codes in one run, with the bit reader's state in local values (`SliceBitReader::rice_run`) | `perf-decoder-rice-runs` | not offered |
+| `9f1cad7` | Tie `CHECK_PRODUCTS` to x86-64 (it was true for 32-bit x86 with AVX2 too, where a checked 64-bit multiplication is a call) | same | not offered |
 
 Each comes with its own equivalence test: `SliceBitReader` and `FrameWriter` against
 bitstream-io's reader and writer on random operations (Rice codes included), prediction
@@ -71,7 +74,10 @@ included), FIXED parameters against the previous algorithm, `sum_of` against 64-
 sums, interleaving and deinterleaving against `MultiZip` and against the sample
 iterator, CRC-16 by slices against bytes, planned residual sizes against written ones
 (failures included), MD5 by buffers against MD5 by samples, the autocorrelation in one
-pass against summing lag by lag (compared as bits), and several threads against one for
+pass against summing lag by lag (compared as bits), runs of Rice codes against single
+codes (from any bit position, with codes longer than the cache and bytes that run out),
+checked against unchecked products and both against the general loop (also with
+products that overflow in the middle of a block), and several threads against one for
 all three writers. `src/md5.rs` is compared with the `md5` crate for every length
 around the block and padding limits and for random input in random pieces, next to the
 test suite of RFC 1321. In debug builds every written subframe is checked against its
@@ -90,6 +96,11 @@ code.
 
 `PATCHES.md`, `tests/hardening.rs`, `tests/memory.rs`, `deny.toml`, `fuzz/` and
 `.github/workflows/checks.yml`. They are not part of any upstream pull request.
+
+The workflow runs the tests, the reference decoders and the large hardening round a
+second time in a build for x86-64-v3 (`fec3958`): such a build takes other paths (the
+checked products above, wider vectors wherever the compiler vectorizes), and an
+application may well ship it.
 
 `tests/hardening.rs`:
 
@@ -204,84 +215,126 @@ that writing more samples than declared fails the same way on several threads.
   `cargo deny check` ok with the `md5` crate as a dev-dependency.
 - cargo-fuzz at `fdcd6f2`, 30 minutes per target: `decode_reference` 98,264 runs,
   `encode_reference` 1,060,314, `roundtrip` 841,679, `decode` 2,228,948, nothing found.
+- After `510c45c` to `9f1cad7` (2026-11-10), in the baseline build and in one for
+  x86-64-v3 alike: 138 tests (also on Rust 1.88 with `rayon` in the baseline build);
+  1,000,000 damaged streams and 20,000 random encoder rounds with overflow checks and
+  debug assertions: clean; libFLAC 1.5.0 and ffmpeg 8.0.1: 288 of 288; encoder output
+  byte-identical to upstream 1.3.3 for the default, best and fast settings.
+- cargo-fuzz at `f8c60a4`, 30 minutes per target (`9f1cad7` after it changes nothing
+  in an x86-64 build): `decode_reference` 84,525 runs, `encode_reference` 736,236,
+  `roundtrip` 662,025, `decode` 706,954; built for x86-64-v3 (the reference commit
+  too): `decode_reference` 86,208 and `roundtrip` 664,892; nothing found.
 - The thread tests found fix 10: dropping a `FlacSampleWriter` or `FlacChannelWriter`
   lost the last partial block in upstream 1.3.3 too (10,000 samples written, 8,192
   decoded).
 
 ## Speed measurements (2026-11-10, one pinned core, 64 IETF subset files with 98.6 million samples)
 
-Best of 5 runs, three rounds alternating between upstream 1.3.3, the branch before the
-last eight speed commits (`f1490aa`) and after them (`fdcd6f2`); libFLAC 1.5.0's `flac`
-on the same core in a container, right after. The machine was not idle (other
-programs used about four of its 32 processors), so the times are a few percent higher
-than on an idle machine for all four alike; the spread between rounds was below 3 %.
+Best of 5 runs, three rounds alternating between upstream 1.3.3, this branch at
+`a79986d` and at `f8c60a4`, the latter built for plain x86-64 (the baseline) and for
+x86-64-v3 (AVX2, BMI2, FMA); libFLAC 1.5.0's `flac` on the same core in a container,
+right after. The machine was idle. The spread between rounds was at most 2 %, and 4 %
+for decoding to bytes.
 
-| | upstream 1.3.3 | `f1490aa` | `fdcd6f2` | libFLAC 1.5.0 |
-|---|---|---|---|---|
-| encode, default (`flac -5`) | 5.761 s | 1.391 s | 1.046 s | 1.170 s |
-| encode, best (`flac -8`) | 6.215 s | 1.613 s | 1.193 s | 2.948 s |
-| encode, fast (`flac -0`) | 2.467 s | 0.782 s | 0.621 s | 0.705 s |
-| decode to samples | 1.608 s | 0.762 s | 0.585 s | |
-| decode with MD5 check (`verify`, `flac -t`) | 1.975 s | 1.046 s | 0.809 s | 0.857 s |
+| | upstream 1.3.3 | `a79986d` | `f8c60a4` | `f8c60a4`, x86-64-v3 | libFLAC 1.5.0 |
+|---|---|---|---|---|---|
+| encode, default (`flac -5`) | 5.748 s | 1.045 s | 1.042 s | 0.826 s | 1.220 s |
+| encode, best (`flac -8`) | 6.237 s | 1.187 s | 1.178 s | 0.967 s | 2.931 s |
+| encode, fast (`flac -0`) | 2.471 s | 0.620 s | 0.613 s | 0.551 s | 0.689 s |
+| decode to samples | 1.601 s | 0.590 s | 0.497 s | 0.457 s | |
+| decode to bytes (`flac -d`, without its MD5) | 1.675 s | 0.605 s | 0.507 s | 0.472 s | 0.629 s |
+| decode with MD5 check (`verify`, `flac -t`) | 1.964 s | 0.807 s | 0.718 s | 0.678 s | 0.845 s |
 
-Against upstream 1.3.3, encoding is 4.0 to 5.5 times as fast and decoding 2.7 times
-(2.4 times with the MD5 check). The output of the encoder is byte-identical. Against
-libFLAC on one core, this branch takes 0.89 of its time at the default setting, 0.40
-at the best, 0.88 at the fast setting and 0.94 for checking.
+Against upstream 1.3.3, encoding is 4.0 to 5.5 times as fast, decoding 3.2 times and
+checking 2.7 times. The output of the encoder is byte-identical, in both builds.
+Against libFLAC on one core, the baseline build takes 0.85 of its time at the default
+setting, 0.40 at the best, 0.89 at the fast one, 0.81 for decoding and 0.85 for
+checking; the x86-64-v3 build 0.68, 0.33, 0.80, 0.75 and 0.80.
+
+How libFLAC was timed: `flac -t` for checking; for decoding `flac -d -c --skip=1` to
+`/dev/null`, one process per file, with the time of 64 process starts (0.018 s) taken
+off. Skipping the first sample makes it seek, which switches its MD5 off (0.91 s with
+the MD5). Encoding reads WAV files and writes FLAC files on tmpfs, while flac-codec
+works in memory, and the presets do not match libFLAC's levels exactly. Its default
+setting took 1.158 s and 1.170 s in two earlier runs of the same day.
 
 With `Options::threads` (plus the hashing thread), the default encode of the 64 files
-takes 0.63 s on 2 threads, 0.43 s on 4 and 0.39 s on 8. A long stream, default
-settings, one core against 8 threads; libFLAC `-5` on one core was measured on
-2026-11-10 before these commits, on the idle machine:
+takes 0.62 s on 2 threads, 0.43 s on 4 and 0.39 s on 8 in the baseline build, and
+0.53 s, 0.40 s and 0.39 s in the x86-64-v3 build. A long stream at the default
+setting; libFLAC `-5` on one core was measured earlier the same day, and the
+x86-64-v3 column while other programs were using the machine, so it is on the slow
+side:
 
-| | one core | 8 threads | libFLAC `-5` |
-|---|---|---|---|
-| 24 bit, 96 kHz, stereo, 175 s | 0.44 s (393 times real time) | 0.15 s | 0.49 s |
-| 16 bit, 44.1 kHz, stereo, 140 s | 0.14 s (986 times real time) | 0.04 s | 0.15 s |
+| | one core | 8 threads | x86-64-v3, one core | libFLAC `-5` |
+|---|---|---|---|---|
+| 24 bit, 96 kHz, stereo, 175 s | 0.44 s (394 times real time) | 0.15 s | 0.36 s | 0.49 s |
+| 16 bit, 44.1 kHz, stereo, 140 s | 0.14 s (986 times real time) | 0.04 s | 0.11 s | 0.15 s |
 
 Beyond 8 threads the MD5 of the samples, which cannot be split, sets the pace.
 
-The presets do not match libFLAC's levels exactly, and libFLAC's times include reading
-WAV files and writing FLAC files on tmpfs, while flac-codec works in memory.
+### Which build
 
-Where the time goes now (perf, by time, default settings on one core, 24 bit at
-96 kHz): window, autocorrelation and LPC residuals 30 %, MD5 19 % and the samples'
-bytes for it 3 %, writing Rice codes 11 %, the FIXED search 11 %, partition sums and
-headers 9 %, exact residual sizes 3 %, CRC-16 2 %. When checking the 64 files: the
-prediction 32 %, reading Rice codes and residuals 29 %, MD5 26 %, the samples' bytes
-3 %, CRC-16 2 %, metadata blocks 3 %.
+Both builds are measured, go through the same checks in CI and are faster than libFLAC
+in every row above. Which one an application ships is its choice
+(`-C target-cpu=...`):
 
-What the last eight commits brought, each measured against the commit before it on
-the 64 files: the MD5 took 6 % off the default encode, 10 % off the fast one and 6 %
-off checking (hashing alone: 895 to 1,182 MB/s); `sum_of` 8 %, 6 % and 7 % off the
-default, fast and best encodes; the float residuals 6 % and 9 % off the default and
-best encodes; converting a buffer of samples at a time 4 % and 5 % off the default
-and fast encodes; the autocorrelation in registers 3 % off the best encode; CRC-16 by
-sixteen 6 % off decoding; the interleaving 8 % off decoding and 6 % off checking; the
-long predictors 10 % off decoding.
+- **Baseline** (plain x86-64) runs on every 64-bit x86 processor.
+- **x86-64-v3** needs AVX2, BMI2 and FMA (Intel since 2013, AMD since 2015) and takes
+  about 20 % less time for encoding at the default and best settings, 10 % less at the
+  fast one, 8 % less for decoding and 6 % less for checking. x86-64-v4 and
+  `-C target-cpu=native` on the test machine (an AMD Ryzen 9 9950X3D) measured within
+  6 % of it.
+- **x86-64-v2** is not worth choosing: decoding as in the baseline, but checking 5 %
+  and encoding 3 to 6 % slower on this AMD processor, because for that level the
+  compiler writes the MD5's rotations as `shld` instructions, which are slow on AMD.
 
-One file of the 64 is still checked faster by libFLAC by more than a few
-milliseconds: the 8-channel file of 32nd-order predictors at 24 bits, 0.27 s against
-0.31 s (0.33 s before `87da9cb` for decoding alone, 0.24 s now). At 24 bits its
-products need 64 bits, and without AVX2 that is two at a time at best.
+Before `510c45c` the x86-64-v3 build decoded 14 % slower than the baseline, ordinary
+streams up to twice as slowly: the compiler gathered the products of the newest
+samples in `predict_order` into vector operations, each 64-bit multiplication put
+together from three 32-bit ones, and every sample had to pass through them before the
+next could begin. Checked products (`CHECK_PRODUCTS`, set for x86-64 with AVX2) stay
+single instructions; with them that build decodes the 64 files in 0.57 s instead of
+0.70 s (before the Rice runs). The speed of such a build depends on what the compiler
+chooses to vectorize, which no test can pin down: after a new Rust release, time the
+decoding of both builds again (measured here with Rust 1.99.1).
 
-Building for newer processors (`-C target-cpu=x86-64-v3`, AVX2) is a choice of the
-application, not of this crate: measured on an AMD Ryzen 9 9950X3D, encoding the 64
-files takes about 20 % less time at the default and best settings and 11 % less at the
-fast one (same bytes), but decoding takes 14 % more and checking 12 % more. The files
-with 32nd-order predictors decode faster there (0.19 s instead of 0.24 s for the
-8-channel one); ordinary streams decode up to twice as slowly, because the compiler
-then computes the products of the newest samples in `predict_order` as vectors, with
-64-bit multiplications put together from 32-bit ones, and each sample has to pass
-through them before the next can begin. Until that is solved the baseline build is
-the better one for an application that also decodes.
+### Where the time goes
 
-The decode figures above are still shaped by three test files that use only
-32nd-order predictors (one of them 8 channels at 192 kHz, 0.24 s of the 0.585 s).
+perf, by time, on one core in the baseline build. Encoding at the default setting,
+24 bit at 96 kHz: window, autocorrelation and LPC residuals 30 %, MD5 19 % and the
+samples' bytes for it 3 %, writing Rice codes 11 %, the FIXED search 11 %, partition
+sums and headers 9 %, exact residual sizes 3 %, CRC-16 2 %. Checking the 64 files: MD5
+30 %, long predictors 21 %, reading Rice codes 19 %, the fixed-size prediction loops
+14 %, the samples' bytes 4 %, metadata blocks 3 %, CRC-16 2 %.
+
+What each of the speed commits of 2026-11-10 brought, measured against the commit
+before it on the 64 files: the MD5 took 6 % off the default encode, 10 % off the fast
+one and 6 % off checking (hashing alone: 895 to 1,182 MB/s); `sum_of` 8 %, 6 % and 7 %
+off the default, fast and best encodes; the float residuals 6 % and 9 % off the
+default and best encodes; converting a buffer of samples at a time 4 % and 5 % off the
+default and fast encodes; the autocorrelation in registers 3 % off the best encode;
+the Rice runs 15 % off decoding (17 % in the x86-64-v3 build); the long predictors
+10 %, the interleaving 8 % and CRC-16 by sixteen 6 % off decoding.
+
+The decode figures are shaped by three test files that use only 32nd-order predictors.
+The largest, 8 channels at 192 kHz and 24 bits, takes 0.20 s of the 0.497 s. It is the
+one file of the 64 that the baseline build does not check clearly faster than libFLAC:
+0.268 s against 0.272 s (decoding to bytes 0.206 s against 0.209 s); the x86-64-v3
+build takes 0.225 s and 0.164 s. At 24 bits its products need 64 bits, and without
+AVX2 that is two at a time at best.
 
 Tried and dropped because they were slower or no faster: summing FIXED magnitudes
-inside the difference loop, a sign-bit overflow check inside `Vec::extend`, keeping
-the whole prediction history in a local array, adding the message words and constants
-of the MD5 beforehand in a function of its own (1,018 MB/s against 1,182 MB/s), and
-other splits between integer and `f64` samples for long predictors (2 to 12 integer
-samples all within 4 %).
+inside the difference loop; a sign-bit overflow check inside `Vec::extend`; keeping
+the whole prediction history in a local array; adding the message words and constants
+of the MD5 beforehand in a function of its own (1,018 MB/s against 1,182 MB/s); other
+splits between integer and `f64` samples for long predictors (2 to 12 integer samples
+all within 4 %); laying the long predictors' groups of products out without a loop
+(the compiler then no longer vectorized them: 0.234 s instead of 0.196 s for the
+8-channel file); checked products in the long predictors' loop too (0.225 s instead of
+0.194 s for that file in the x86-64-v3 build) or only for the newest samples of the
+fixed-size loops (0.62 s instead of 0.57 s for the 64 files there); and finding a Rice
+code's end with `checked_ilog2` (2 % slower in the baseline build).
+
+Not measured or tested as of 2026-11-10: the x86-64-v3 build on Intel processors (the
+figures are from one AMD processor); the speed on aarch64 (CI only tests there);
+32-bit targets; libFLAC with several threads (`flac -j`).
