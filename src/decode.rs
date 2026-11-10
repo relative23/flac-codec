@@ -420,16 +420,15 @@ impl<R: std::io::Read> FlacSampleReader<R> {
         if self.buf.is_empty() {
             match self.decoder.read_frame()? {
                 Some(frame) => {
-                    self.buf.extend(frame.iter());
+                    refill(&mut self.buf, frame);
                 }
                 None => return Ok(0),
             }
         }
 
         let to_consume = samples.len().min(self.buf.len());
-        for (i, o) in samples.iter_mut().zip(self.buf.drain(0..to_consume)) {
-            *i = o;
-        }
+        samples[..to_consume].copy_from_slice(&self.buf[..to_consume]);
+        self.buf.drain(..to_consume);
         Ok(to_consume)
     }
 
@@ -469,7 +468,7 @@ impl<R: std::io::Read> FlacSampleReader<R> {
         if self.buf.is_empty() {
             match self.decoder.read_frame()? {
                 Some(frame) => {
-                    self.buf.extend(frame.iter());
+                    refill(&mut self.buf, frame);
                 }
                 None => return Ok(&[]),
             }
@@ -703,7 +702,8 @@ impl<R: std::io::Read> Iterator for FlacSampleIterator<R> {
         self.buf.pop_front().map_or_else(
             || match self.decoder.read_frame() {
                 Ok(Some(frame)) => {
-                    self.buf.extend(frame.iter());
+                    self.buf.resize(frame.samples_len(), 0);
+                    frame.interleave(self.buf.make_contiguous(), |sample| sample);
                     self.buf.pop_front().map(Ok)
                 }
                 Err(e) => Some(Err(e)),
@@ -1227,8 +1227,10 @@ impl<R: std::io::BufRead> FlacStreamReader<R> {
         )?;
 
         if crc16_reader.into_checksum().valid() {
-            self.samples.clear();
-            self.samples.extend(self.buf.iter());
+            // (every sample is assigned, so a buffer of the same length
+            // is left as it is)
+            self.samples.resize(self.buf.samples_len(), 0);
+            self.buf.interleave(&mut self.samples, |sample| sample);
 
             Ok(FrameBuf {
                 samples: self.samples.as_slice(),
@@ -1280,6 +1282,14 @@ pub enum Verified {
     NoMD5,
 }
 
+/// Refills `buf`, which is empty, with the frame's samples in interleaved order
+#[inline]
+fn refill(buf: &mut Vec<i32>, frame: &Frame) {
+    debug_assert!(buf.is_empty());
+    buf.resize(frame.samples_len(), 0);
+    frame.interleave(buf, |sample| sample);
+}
+
 /// Verifies FLAC file for correctness
 pub fn verify<P: AsRef<Path>>(p: P) -> Result<Verified, Error> {
     File::open(p.as_ref())
@@ -1292,12 +1302,22 @@ pub fn verify<P: AsRef<Path>>(p: P) -> Result<Verified, Error> {
 /// The stream must be set to the start of the FLAC data
 pub fn verify_reader<R: std::io::Read>(r: R) -> Result<Verified, Error> {
     use crate::byteorder::LittleEndian;
+    use std::io::BufRead;
 
     let mut r = FlacByteReader::endian(r, LittleEndian)?;
     match r.md5().cloned() {
         Some(flac_md5) => {
+            // each frame's bytes straight from the reader's own buffer
             let mut output_md5 = Md5::default();
-            std::io::copy(&mut r, &mut output_md5)?;
+            loop {
+                let bytes = r.fill_buf()?;
+                if bytes.is_empty() {
+                    break;
+                }
+                output_md5.update(bytes);
+                let hashed = bytes.len();
+                r.consume(hashed);
+            }
             Ok(if flac_md5 == output_md5.finalize() {
                 Verified::MD5Match
             } else {

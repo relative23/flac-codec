@@ -83,6 +83,12 @@ impl Frame {
         self.bits_per_sample.div_ceil(8) as usize
     }
 
+    /// Returns total number of samples, in all channels
+    #[inline]
+    pub fn samples_len(&self) -> usize {
+        self.channels * self.channel_len
+    }
+
     /// Returns total length of buffer in bytes
     #[inline]
     pub fn bytes_len(&self) -> usize {
@@ -112,27 +118,54 @@ impl Frame {
     /// Fills buffer with our samples in the given endianness
     pub fn to_buf<E: crate::byteorder::Endianness>(&self, buf: &mut [u8]) {
         match self.bytes_per_sample() {
-            1 => {
-                for (sample, bytes) in self.iter().zip(buf.as_chunks_mut().0) {
-                    *bytes = E::i8_to_bytes(sample as i8);
-                }
-            }
-            2 => {
-                for (sample, bytes) in self.iter().zip(buf.as_chunks_mut().0) {
-                    *bytes = E::i16_to_bytes(sample as i16);
-                }
-            }
-            3 => {
-                for (sample, bytes) in self.iter().zip(buf.as_chunks_mut().0) {
-                    *bytes = E::i24_to_bytes(sample);
-                }
-            }
-            4 => {
-                for (sample, bytes) in self.iter().zip(buf.as_chunks_mut().0) {
-                    *bytes = E::i32_to_bytes(sample);
-                }
-            }
+            1 => self.interleave(buf.as_chunks_mut().0, |s| E::i8_to_bytes(s as i8)),
+            2 => self.interleave(buf.as_chunks_mut().0, |s| E::i16_to_bytes(s as i16)),
+            3 => self.interleave(buf.as_chunks_mut().0, E::i24_to_bytes),
+            4 => self.interleave(buf.as_chunks_mut().0, E::i32_to_bytes),
             _ => panic!("unsupported number of bytes per sample"),
+        }
+    }
+
+    /// Writes our samples to `out` in interleaved order, like:
+    /// [left₀ , right₀ , left₁ , right₁ , left₂ , right₂ , …]
+    ///
+    /// `out` is filled as far as it and the samples reach.
+    pub fn interleave<T>(&self, out: &mut [T], convert: impl Fn(i32) -> T) {
+        let samples = &self.samples[..self.channels * self.channel_len];
+        if samples.is_empty() {
+            // (no channels, or channels of no samples, which cannot be split)
+            return;
+        }
+        match self.channels {
+            1 => {
+                for (sample, place) in samples.iter().zip(out) {
+                    *place = convert(*sample);
+                }
+            }
+            // stereo, by far the most common, in one pass over both channels
+            2 => {
+                let (left, right) = samples.split_at(self.channel_len);
+                let (pairs, rest) = out.as_chunks_mut();
+                for ((left, right), places) in left.iter().zip(right).zip(pairs.iter_mut()) {
+                    *places = [convert(*left), convert(*right)];
+                }
+                // room for half a PCM frame more
+                if let (Some(place), Some(left)) = (rest.first_mut(), left.get(pairs.len())) {
+                    *place = convert(*left);
+                }
+            }
+            // any other layout one channel at a time, each sample to its
+            // place in its PCM frame
+            channels => {
+                for (first, channel) in samples.chunks_exact(self.channel_len).enumerate() {
+                    for (sample, place) in channel
+                        .iter()
+                        .zip(out.iter_mut().skip(first).step_by(channels))
+                    {
+                        *place = convert(*sample);
+                    }
+                }
+            }
         }
     }
 
@@ -361,6 +394,61 @@ fn fills_from_samples_like_multizip() {
                 "{channels} channels, {len}"
             );
             assert_eq!(frame.channel_len, len);
+        }
+    }
+}
+
+#[test]
+fn interleaves_like_the_iterator() {
+    use crate::byteorder::{BigEndian, LittleEndian};
+
+    for channels in 0..=8 {
+        for len in [0, 1, 2, 7, 1000] {
+            for bits in [8, 12, 16, 20, 24, 32] {
+                let mut frame = Frame::empty(channels, bits);
+                for (i, sample) in frame.resize(bits, channels, len).iter_mut().enumerate() {
+                    *sample = (i as i32).wrapping_mul(0x0101_0907) >> (32 - bits);
+                }
+                // the previous way: every interleaved position in turn
+                let expected: Vec<i32> = frame.iter().collect();
+                let case = format!("{channels} channels, {len} samples, {bits} bits");
+
+                let mut samples = vec![i32::MIN; expected.len()];
+                frame.interleave(&mut samples, |sample| sample);
+                assert_eq!(samples, expected, "{case}");
+                assert_eq!(frame.samples_len(), expected.len(), "{case}");
+
+                // room for fewer or more samples is filled as far as both reach
+                let mut short = vec![i32::MIN; expected.len() / 2];
+                frame.interleave(&mut short, |sample| sample);
+                assert_eq!(short, expected[..short.len()], "{case}");
+                let mut long = vec![i32::MIN; expected.len() + 3];
+                frame.interleave(&mut long, |sample| sample);
+                assert_eq!(long[..expected.len()], expected, "{case}");
+                assert_eq!(long[expected.len()..], [i32::MIN; 3], "{case}");
+
+                // bytes of both orders, each sample converted on its own
+                let width = frame.bytes_per_sample();
+                let mut little = vec![0xAA; frame.bytes_len()];
+                frame.to_buf::<LittleEndian>(&mut little);
+                let mut big = vec![0xAA; frame.bytes_len()];
+                frame.to_buf::<BigEndian>(&mut big);
+                let bytes = |sample: i32, big: bool| -> Vec<u8> {
+                    let all = match big {
+                        true => sample.to_be_bytes(),
+                        false => sample.to_le_bytes(),
+                    };
+                    match big {
+                        true => all[4 - width..].to_vec(),
+                        false => all[..width].to_vec(),
+                    }
+                };
+                let expected_little: Vec<u8> =
+                    expected.iter().flat_map(|s| bytes(*s, false)).collect();
+                let expected_big: Vec<u8> = expected.iter().flat_map(|s| bytes(*s, true)).collect();
+                assert_eq!(little, expected_little, "{case}");
+                assert_eq!(big, expected_big, "{case}");
+            }
         }
     }
 }
